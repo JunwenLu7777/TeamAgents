@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["src/index.ts", "tests/engine.test.ts", "tests/model.test.ts", "tests/runtime.test.ts", "tests/projection.test.ts", "tests/host.test.ts", "tests/draft-plan.test.ts", "tests/model-route.test.ts", "tests/remote.test.ts"]
+}

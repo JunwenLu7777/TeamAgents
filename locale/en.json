@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TeamAgents",
+    "description": "Configure members and task dependencies in Settings, save drafts, and explicitly start, stop or retry persistent agent teams."
+  }
+}
