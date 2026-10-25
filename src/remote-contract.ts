@@ -26,7 +26,7 @@ export const TeamRemoteRequests = {
 } as const;
 export type TeamRemoteRequest<Action extends TeamRemoteAction> = z.infer<(typeof TeamRemoteRequests)[Action]>;
 
-// Public 0.2.1-rc.2 codec/contribution contracts, shared by both faces. No SRC
+// Public DSH 0.2.1 codec/contribution contracts, shared by both faces. No SRC
 // fallback, invented transport types, or declarations standing in for runtime validation.
 // Refinements (notably DAG validation) are not losslessly representable as tool
 // JSON Schema. Remote needs the real parser, not a lossy tool-schema projection.

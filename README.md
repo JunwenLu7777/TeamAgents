@@ -2,7 +2,7 @@
 
 一个独立命名的 DeepSeek Harness 多 Agent 协作插件。产品方向参考 [limuyang2/agent-team](https://github.com/limuyang2/agent-team)，没有复制其源码。
 
-**目标宿主：DeepSeek Harness 0.2.1-rc.2，Web / Desktop 的 Web 界面。** 当前版本 **0.4.1**，不是参考插件的替换包，不承诺较早 SDK 或存档兼容性。
+**目标宿主：DeepSeek Harness 0.2.1-rc.3，Web / Desktop 的 Web 界面。** 当前版本 **0.4.1**，不是参考插件的替换包，不承诺较早 SDK 或存档兼容性。
 
 ## v0.4.1：运行面板移至顶部会话标签
 
