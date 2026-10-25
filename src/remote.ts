@@ -10,6 +10,8 @@ import type {} from '@deepseek-ai/dsh-workspace';
 import type { TeamEngine } from './engine.js';
 import type { Team, TeamModelOption } from './model.js';
 import { buildTeamRunExport } from './run-export.js';
+import { MemberActivityReader } from './member-activity.js';
+import type { MemberActivity } from './member-activity-contract.js';
 import { TeamRunExportError, type TeamRunExportResult } from './run-export-contract.js';
 import {
   TEAM_REMOTE, TEAM_REMOTE_PACKAGE, TEAM_REMOTE_SERVICE, TeamRemoteRequests,
@@ -30,8 +32,10 @@ const sessionResource = (request: { sessionId: string }) => SessionId(request.se
 /** No tool execution or human-message fabrication: browser controls call the domain directly. */
 class TeamRemoteService extends TypertRemoteService {
   private readonly lifetime = new AbortController();
+  private readonly activity: MemberActivityReader;
   constructor(ctx: Context, private readonly engine: TeamEngine) {
     super(ctx, TEAM_REMOTE_SERVICE);
+    this.activity = new MemberActivityReader(ctx, engine);
     ctx.effect(() => () => { this.lifetime.abort(new Error('Team settings service unloaded')); });
   }
 
@@ -74,7 +78,7 @@ class TeamRemoteService extends TypertRemoteService {
         if (ctx.workspaceRegistry.get(workspace.id) !== workspace) {
           throw new RemoteError('team-agents/workspace-mismatch', 'The captain workspace is no longer registered in DSH.', {});
         }
-        const current = this.engine.snapshot(id);
+        const current = this.engine.location(id);
         if (current && (current.ownerSessionId !== id || current.workspaceId !== workspace.id)) {
           throw new RemoteError('team-agents/workspace-mismatch', 'The saved team does not belong to this captain and workspace.', {});
         }
@@ -94,7 +98,7 @@ class TeamRemoteService extends TypertRemoteService {
     check();
     if (!workspace) throw new RemoteError('team-agents/workspace-mismatch', 'The captain workspace is not currently registered in DSH.', {});
     return {
-      owner: id, workspaceId: workspace.id, check, signal: active,
+      owner: id, workspaceId: workspace.id, cwd: header.cwd, check, signal: active,
       acceptLive: (agent: Agent) => {
         if (initialAgent && initialAgent !== agent) throw unavailable();
         const liveCheck = () => { assertCurrent(agent, agent.session); root(agent.session.header); };
@@ -121,6 +125,13 @@ class TeamRemoteService extends TypertRemoteService {
     const captain = await this.captain('read', input.sessionId, signal);
     captain.check();
     return this.engine.snapshot(captain.owner);
+  }
+
+  @Remote({ resources: { session: sessionResource } })
+  async *watchMember(request: TeamRemoteRequest<'watchMember'>, signal: AbortSignal): AsyncGenerator<MemberActivity> {
+    const input = TeamRemoteRequests.watchMember.parse(request);
+    const captain = await this.captain('watchMember', input.sessionId, signal);
+    yield* this.activity.watch(captain, input.member);
   }
 
   @Remote({ resources: { session: sessionResource } })

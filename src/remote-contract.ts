@@ -1,17 +1,19 @@
 import { z } from 'zod';
 import { createTypertRemoteInfo } from '@deepseek-ai/dsh-typert-protocol/remote-info';
-import type { RemoteResult, TypertRemoteCodecSpec, TypertRemoteMethodSpec, TypertRemoteNamespace } from '@deepseek-ai/dsh-typert-protocol';
+import type { RemoteResult, RemoteStreamHandle, TypertRemoteCodecSpec, TypertRemoteMethodSpec, TypertRemoteNamespace } from '@deepseek-ai/dsh-typert-protocol';
 import { TeamPlanSchema, TeamSchema, TeamModelOptionsSchema, taskId, type Team, type TeamModelOption } from './model.js';
 import {
   TeamRunExportRequestSchema, TeamRunExportResultSchema,
   type TeamRunExportRequest, type TeamRunExportResult,
 } from './run-export-contract.js';
 
+import { MemberActivityRequestSchema, MemberActivitySchema, type MemberActivity } from './member-activity-contract.js';
+
 /** These are ACL action names, not new policies. Unrecognized actions remain default-deny. */
 export const TEAM_REMOTE_ENDPOINTS = {
   read: 'teamAgents/read', save: 'teamAgents/save', start: 'teamAgents/start',
   stop: 'teamAgents/stop', retry: 'teamAgents/retry', models: 'teamAgents/models',
-  exportRun: 'teamAgents/exportRun',
+  exportRun: 'teamAgents/exportRun', watchMember: 'teamAgents/watchMember',
 } as const;
 export type TeamRemoteAction = keyof typeof TEAM_REMOTE_ENDPOINTS;
 export const TEAM_REMOTE_SERVICE = 'teamAgents';
@@ -31,6 +33,7 @@ export const TeamRemoteRequests = {
   // Options only: no owner, principal, path, team selector, model or revision
   // mutation can be supplied by a caller.
   exportRun: TeamRunExportRequestSchema,
+  watchMember: MemberActivityRequestSchema,
 } as const;
 export type TeamRemoteRequest<Action extends TeamRemoteAction> = z.infer<(typeof TeamRemoteRequests)[Action]>;
 
@@ -68,6 +71,7 @@ export const TEAM_REMOTE = createTypertRemoteInfo({
     [TEAM_REMOTE_ENDPOINTS.retry]: method('retry', teamResult('Team')),
     // The export envelope is validated by its own schema, never by TeamSchema.
     [TEAM_REMOTE_ENDPOINTS.exportRun]: method('exportRun', codec('TeamRunExportResult', TeamRunExportResultSchema)),
+    [TEAM_REMOTE_ENDPOINTS.watchMember]: { ...method('watchMember', codec('MemberActivity', MemberActivitySchema)), mode: 'stream' },
   },
 }, z);
 
@@ -75,6 +79,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
   // The current SDK's typed endpoint vocabulary must describe the actual
   // mounted runtime methods above (also consumed by native useAccess()).
   interface TypertRemoteMap {
+    'teamAgents/watchMember': (request: TeamRemoteRequest<'watchMember'>, signal?: AbortSignal) => RemoteStreamHandle<MemberActivity, never>;
     'teamAgents/read': (request: TeamRemoteRequest<'read'>, signal?: AbortSignal) => Promise<RemoteResult<Team | null>>;
     'teamAgents/models': (request: TeamRemoteRequest<'models'>, signal?: AbortSignal) => Promise<RemoteResult<TeamModelOption[]>>;
     'teamAgents/exportRun': (request: TeamRunExportRequest, signal?: AbortSignal) => Promise<RemoteResult<TeamRunExportResult>>;
@@ -87,6 +92,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     teamAgents: TypertRemoteNamespace<'teamAgents'>;
   }
   interface RemoteErrorDetailsMap {
+    'team-agents/member-unavailable': {};
     'team-agents/owner-required': {};
     'team-agents/session-unavailable': {};
     'team-agents/workspace-mismatch': {};

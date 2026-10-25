@@ -25,13 +25,14 @@ export function TeamConversationView({ sessionId, useProjection, useAccess, t, r
   const canStop = useAccess(TEAM_REMOTE_ENDPOINTS.stop);
   // Export authority is independent of Stop; unknown access is a denial.
   const canExport = useAccess(TEAM_REMOTE_ENDPOINTS.exportRun);
+  const canInspect = useAccess(TEAM_REMOTE_ENDPOINTS.watchMember);
   const actions = useMemo(() => remote.forSession(sessionId), [remote, sessionId]);
   // A projection from a previous/forked session must never bleed into this tab.
   const team = projected?.ownerSessionId === sessionId ? projected : undefined;
   return <section className="dsh-team-view" aria-label={t('view.label')}>
     <style>{styles}</style>
     {team ? <TeamDashboard key={`${sessionId}:${team.id}`} presentation="page" sessionId={sessionId}
-      team={team} canStop={canStop === true} canExport={canExport === true} actions={actions} t={t} />
+      team={team} canStop={canStop === true} canExport={canExport === true} canInspect={canInspect === true} actions={actions} t={t} />
       : <div className="dtv-empty" role="status"><h2>{t('view.label')}</h2>
         <p>{t(projected === undefined ? 'view.loading' : projected === null ? 'view.empty' : 'view.unavailable')}</p>
         <p className="dtv-hint">{t('view.chatHint')}</p>

@@ -85,7 +85,7 @@ describe('TeamDashboard', () => {
     expect(html).toContain('1 pending');
     expect(html).toContain('1 failed');
     expect(html).toMatch(/data-status="active">Active/);
-    expect(html).toMatch(/data-status="idle">Idle/);
+    expect(html).toMatch(/data-status="failed">Failed/);
     expect(html).toContain('Working on design');
     expect(html).toContain('<code class="dta-tag">plan</code>');
     expect(html).toContain('Waiting for: design');
@@ -130,7 +130,7 @@ describe('TeamDashboard', () => {
     expect(html).toContain('版本 7');
     expect(html).toContain('已完成 1/4');
     expect(html).toContain('工作中');
-    expect(html).toContain('空闲');
+    expect(html).toContain('失败');
     expect(html).toContain('等待前置任务：design');
     expect(html).toContain('写入范围 · 约定');
     expect(html).toContain('在对话中管理团队。');
@@ -396,7 +396,7 @@ describe('current DSH client integration', () => {
     // exact native ACL string once the transport descriptor is registered.
     const exportEndpoint = (TEAM_REMOTE_ENDPOINTS as Record<string, string>).exportRun;
     expect(exportEndpoint).toBe('teamAgents/exportRun');
-    expect([...new Set(useAccess.mock.calls.map(([endpoint]) => endpoint))].sort()).toEqual([exportEndpoint, 'teamAgents/stop']);
+    expect([...new Set(useAccess.mock.calls.map(([endpoint]) => endpoint))].sort()).toEqual([exportEndpoint, 'teamAgents/stop', 'teamAgents/watchMember']);
     fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
     await waitFor(() => expect(stop).toHaveBeenCalledWith('captain-session', expect.any(AbortSignal)));
     expect(forSession).toHaveBeenCalledOnce();

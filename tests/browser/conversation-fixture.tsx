@@ -8,6 +8,7 @@ import { zh, type TeamTranslate } from '../../src/locales.js';
 import { TeamSchema } from '../../src/model.js';
 import type { TeamSettingsActions } from '../../src/settings-contract.js';
 import { TEAM_RUN_EXPORT_SCHEMA_VERSION, type TeamRunExportResult } from '../../src/run-export-contract.js';
+import type { MemberActivity } from '../../src/member-activity-contract.js';
 
 type Scenario = { id: string; width: number; height: number; theme: 'light' | 'dark'; mode: 'team' | 'empty' };
 const scenario = JSON.parse(decodeURIComponent(location.hash.slice(1))) as Scenario;
@@ -42,7 +43,32 @@ const fixtureResult: TeamRunExportResult = {
   mimeType: 'text/markdown;charset=utf-8', content: fixtureContent,
   byteLength: new TextEncoder().encode(fixtureContent).byteLength,
 };
+let activityStarts = 0, activityCloses = 0;
+let pushActivity: ((value: MemberActivity) => void) | undefined;
+const activityFrame = (sequence = 1, failed = false): MemberActivity => ({
+  ownerSessionId: snapshot.ownerSessionId, teamId: snapshot.id, member: 'backend', childSessionId: 'fixture-child', sequence,
+  cursor: sequence, observedAt: Date.now(), live: !failed, status: failed ? 'failed' : 'running', phase: failed ? 'idle' : 'tool',
+  startedAt: Date.now() - 65000, endedAt: failed ? Date.now() : null, elapsedMs: 65000, lastActivityAt: Date.now(),
+  task: { id: 'review-1', subject: '核对接口与源码', status: failed ? 'failed' : 'running', ...(failed ? { error: 'Task deadline exceeded（隔离夹具）' } : {}) },
+  entries: [{ id: 'event-1', seq: 1, time: Date.now() - 2000, kind: 'tool', label: 'read', status: 'completed', endedAt: Date.now(),
+    arguments: '{"file_path":"src/remote.ts"}', text: '已读取接口定义（合成工具结果，无真实文件读取）。', truncated: false }],
+  historyTruncated: false, liveOutput: failed ? '' : '正在检查成员与父会话的归属校验…（合成流式输出）', livePartial: false, liveTruncated: false,
+});
 const actions: TeamSettingsActions = {
+  watchMember: async function* (member, signal) {
+    if (member !== 'backend') return forbidden('unexpected-member');
+    activityStarts++;
+    const queue: MemberActivity[] = [activityFrame()];
+    let wake: (() => void) | undefined;
+    const notify = () => { const resume = wake; wake = undefined; resume?.(); };
+    const push = (value: MemberActivity) => { queue.push(value); notify(); }; pushActivity = push;
+    signal?.addEventListener('abort', notify, { once: true });
+    try { while (!signal?.aborted) {
+      if (!queue.length) await new Promise<void>(resolve => { wake = resolve; });
+      if (signal?.aborted) return;
+      const value = queue.shift(); if (value) yield value;
+    } } finally { signal?.removeEventListener('abort', notify); if (pushActivity === push) pushActivity = undefined; activityCloses++; }
+  },
   read: async () => forbidden('read'), models: async () => forbidden('models'), save: async () => forbidden('save'),
   start: async () => forbidden('start'), stop: async () => forbidden('stop'), retry: async () => forbidden('retry'),
   exportRun: async options => {
@@ -130,7 +156,7 @@ async function checkLayout() {
     record('there is no Start control', ![...page.querySelectorAll('button')].some(button => /启动|Start/.test(button.textContent ?? '')), null),
   );
   main.scrollTop = 0; await settle();
-  if (scenario.mode !== 'empty') await checkExport(page);
+  if (scenario.mode !== 'empty') { await checkExport(page); await checkActivity(page); }
   return { scenario, pass: checks.every(check => check.pass), checks };
 }
 
@@ -196,5 +222,24 @@ async function checkExport(page: HTMLElement) {
     record('export interaction caused no other Remote call, model call, or storage access', calls.length === 0 && exportCalls.length === 1, { calls, exportCalls }),
   );
   HTMLAnchorElement.prototype.click = nativeAnchorClick;
+}
+async function checkActivity(page: HTMLElement) {
+  checks.push(record('member streams do not open automatically', activityStarts === 0, activityStarts));
+  const select = [...page.querySelectorAll<HTMLButtonElement>('.dta-member-open')].find(button => button.textContent?.includes('backend'));
+  select?.click(); await settle();
+  const panel = page.querySelector<HTMLElement>('.dta-activity');
+  checks.push(record('explicit member selection opens exactly one read-only stream', !!panel && activityStarts === 1, activityStarts));
+  checks.push(record('public live output is visible', panel?.textContent?.includes('合成流式输出') === true, null));
+  checks.push(record('tool arguments and results remain readable disclosures', panel?.textContent?.includes('src/remote.ts') === true && panel?.textContent?.includes('合成工具结果') === true, null));
+  checks.push(record('turn elapsed and last activity are visible', panel?.textContent?.includes('最近一轮耗时') === true && panel?.textContent?.includes('最近活动时间') === true, null));
+  pushActivity?.(activityFrame(2, true)); await settle();
+  checks.push(record('updated failure appears without polling or a model call', panel?.querySelector('[role=alert]')?.textContent?.includes('Task deadline exceeded') === true && calls.length === 0, null));
+  const width = rect(panel!);
+  checks.push(record('member detail has no horizontal overflow', panel!.scrollWidth <= panel!.clientWidth + 1, { width, scrollWidth: panel!.scrollWidth, clientWidth: panel!.clientWidth }));
+  [...panel!.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === '关闭成员详情')!.click(); await settle();
+  checks.push(record('closing details releases the stream without stopping execution', activityCloses === 1 && page.querySelector('.dta-activity') === null && calls.length === 0, { activityCloses, calls }));
+  select!.click(); await settle();
+  checks.push(record('reopening restores a new isolated stream', activityStarts === 2 && activityCloses === 1, { activityStarts, activityCloses }));
+  page.querySelector<HTMLElement>('.dta-activity')!.scrollIntoView({ block: 'start' }); await settle();
 }
 Object.assign(window, { layoutFixture: { prepare, checkLayout } });

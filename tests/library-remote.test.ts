@@ -203,8 +203,8 @@ describe('sessionless native library client', () => {
     const c = await clientFixture(h);
     const legacyClient = c.client.plugin({ name: 'legacy-client-coexistence', inject: ['remote'], async apply(ctx: Context) { await mountTeamRemote(ctx); } });
     await legacyClient;
-    expect(c.client.typert.remotes.list()).toHaveLength(10);
-    await c.fiber.dispose(); expect(c.client.typert.remotes.list()).toHaveLength(7);
+    expect(c.client.typert.remotes.list()).toHaveLength(11);
+    await c.fiber.dispose(); expect(c.client.typert.remotes.list()).toHaveLength(8);
     await h.remoteFiber.dispose();
     expect(h.host.typert.local.get(TEAM_REMOTE_ENDPOINTS.read)).toBeDefined();
     expect(h.host.typert.local.get(TEAM_LIBRARY_REMOTE_ENDPOINTS.read)).toBeUndefined();

@@ -56,6 +56,24 @@ export class TeamEngine {
     const team = this.table.get(owner);
     return team ? structuredClone(team) : null;
   }
+  /** Narrow read views avoid cloning the whole team's outputs on every streaming update. */
+  location(owner: string): { ownerSessionId: string; workspaceId: string } | null {
+    const team = this.table.get(owner);
+    return team ? { ownerSessionId: team.ownerSessionId, workspaceId: team.workspaceId } : null;
+  }
+  activityTarget(owner: string, name: string) {
+    const team = this.table.get(owner);
+    const member = team?.members.find(value => value.name === name);
+    if (!team || !member) return null;
+    const assigned = team.tasks.filter(task => task.assignee === name);
+    const attempted = assigned.filter(task => task.attempt > 0).sort((a, b) =>
+      (Date.parse(b.startedAt ?? '') || 0) - (Date.parse(a.startedAt ?? '') || 0));
+    const task = assigned.find(task => task.status === 'running') ?? attempted[0] ?? assigned[0];
+    return { teamId: team.id, ownerSessionId: team.ownerSessionId, workspaceId: team.workspaceId,
+      member: member.name, childSessionId: member.sessionId ?? null,
+      task: task ? { id: task.id, subject: task.subject, status: task.status,
+        startedAt: task.startedAt, endedAt: task.endedAt, error: task.error } : null };
+  }
   identity(sessionId: string): { owner: string; member: string } | undefined {
     for (const [owner, team] of this.table.entries()) {
       const member = team.members.find(m => m.sessionId === sessionId);

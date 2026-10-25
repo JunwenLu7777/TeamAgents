@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context, Service } from '@deepseek-ai/cordis';
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent';
-import type { LlmModelInfo, LlmProviderInfo } from '@deepseek-ai/dsh-llm';
+import { LlmAttemptId, type LlmModelInfo, type LlmProviderInfo } from '@deepseek-ai/dsh-llm';
+import type { SessionEvent } from '@deepseek-ai/dsh-session';
+import { MemberActivitySchema, type MemberActivity } from '../src/member-activity-contract.js';
 import { Session, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import Gateway from '@deepseek-ai/dsh-api-gateway';
@@ -51,7 +53,8 @@ async function fixture() {
   const engine = new TeamEngine({ get: key => rows.get(key), entries: () => rows.entries(),
     put: async (key, value) => { rows.set(key, structuredClone(value)); } }, driver);
   host.provide('agents', { get: (id: string) => actors.get(id), roots: () => [...actors.values()].filter(agent => !runtimeChildren.has(agent.id)),
-    create: createAgent, resume: createAgent });
+    create: createAgent, resume: createAgent,
+    isOwnedBy: (id: string, owner: Agent) => runtimeChildren.has(id) && actors.get(id)?.session.header.parentSession === owner.id });
   host.provide('sessions', { get: (id: string) => sessions.get(id) });
   host.provide('workspaceRegistry', { archivedSessionIds: archived, resolveByPath, get: workspaceGet });
   const inspect = vi.fn(async (id: string, signal?: AbortSignal) => {
@@ -137,9 +140,9 @@ async function clientFixture(h: Awaited<ReturnType<typeof fixture>>, peer: PeerS
 describe('current SDK native TeamAgents Remote descriptors', () => {
   it('registers real strict descriptors and session resource markers for every action', async () => {
     const h = await fixture();
-    expect(TEAM_REMOTE.descriptors).toHaveLength(7);
+    expect(TEAM_REMOTE.descriptors).toHaveLength(8);
     const markers = remoteMethods(h.host.get('teamAgents'));
-    expect(markers.map(marker => marker.method).sort()).toEqual(['exportRun', 'models', 'read', 'retry', 'save', 'start', 'stop']);
+    expect(markers.map(marker => marker.method).sort()).toEqual(['exportRun', 'models', 'read', 'retry', 'save', 'start', 'stop', 'watchMember']);
     for (const action of Object.keys(TEAM_REMOTE_ENDPOINTS) as TeamRemoteAction[]) {
       const endpoint = TEAM_REMOTE_ENDPOINTS[action];
       const descriptor = h.host.typert.local.get(endpoint)!;
@@ -258,6 +261,146 @@ describe('read-only run export over the real native Gateway', () => {
     expect(result.byteLength).toBeGreaterThan(1_000_000); expect(c.calls[0]!.endpoint).toBe('teamAgents/exportRun');
     expect(h.resolveAgent).not.toHaveBeenCalled(); expect(h.stream).not.toHaveBeenCalled();
     await c.fiber.dispose(); await expect(c.actions.forSession('captain').exportRun({ format: 'json' })).rejects.toThrow();
+  });
+});
+
+async function activityFixture(cold = false) {
+  const h = await fixture(); const saved = await h.save();
+  const child = h.actor('child', { parentSession: h.captain.id, origin: 'subagent', delegationDepth: 1 });
+  Object.assign(child, { status: 'running' }); h.runtimeChildren.add(child.id);
+  saved.members[0]!.sessionId = child.id; h.rows.set('captain', saved);
+  const log: SessionEvent[] = [];
+  const original = h.inspect.getMockImplementation()!;
+  h.inspect.mockImplementation(async (id, signal) => id === 'child'
+    ? { meta: child.session.header, inheritedEventCount: 0, events: [...log] } : original(id, signal));
+  const emit = (type: string, data: unknown) => {
+    const event = { type, data, seq: log.length, time: Date.now() } as unknown as SessionEvent;
+    log.push(event); h.host.emit('session/event', child.session, event); return event;
+  };
+  if (cold) { h.actors.delete('child'); h.sessions.delete('child'); }
+  async function open(request: unknown = { sessionId: 'captain', member: 'researcher' }, peer = h.owner) {
+    const abort = new AbortController();
+    const stream = await h.host.typertGateway.stream({ namespace: 'teamAgents', method: 'watchMember', args: { request }, peer, signal: abort.signal });
+    const iterator = stream[Symbol.asyncIterator]();
+    const stop = async () => { abort.abort(); await iterator.return?.().catch(() => {}); };
+    cleanups.push(stop);
+    return { abort, iterator, stop, next: async () => {
+      const next = await iterator.next();
+      return next.done ? undefined : MemberActivitySchema.parse(next.value);
+    } };
+  }
+  return { ...h, child, log, emit, open };
+}
+
+describe('authorized live member observation without activation', () => {
+  it('shows a not-yet-created member without inspecting any child or running a model', async () => {
+    const h = await activityFixture(); h.rows.get('captain')!.members[0]!.sessionId = undefined;
+    const stream = await h.open(); const value = await stream.next();
+    expect(value).toMatchObject({ status: 'not-started', childSessionId: null, member: 'researcher', entries: [] });
+    expect(await stream.next()).toBeUndefined();
+    expect(h.inspect.mock.calls.every(([id]) => id === 'captain')).toBe(true);
+    expect(h.resolveAgent).not.toHaveBeenCalled(); expect(h.driver.run).not.toHaveBeenCalled();
+  });
+  it('reads cold history with tool results and task failure without restoring an Agent', async () => {
+    const h = await activityFixture(true);
+    h.emit('turn/start', { turn: 1 }); h.emit('tool/call', { callId: 'call', name: 'read', arguments: '{"path":"README.md","token":"PRIVATE"}' });
+    h.emit('tool/result', { message: { source: { callId: 'call' }, content: [{ type: 'text', text: 'Read completed' }], isError: false } });
+    h.emit('turn/end', { reason: { kind: 'aborted', reason: { kind: 'parent' } } });
+    Object.assign(h.rows.get('captain')!.tasks[0]!, { status: 'failed', attempt: 1, error: 'Task deadline exceeded' });
+    const before = structuredClone(h.rows.get('captain'));
+    const stream = await h.open(); const value = (await stream.next())!;
+    expect(value).toMatchObject({ live: false, status: 'failed', phase: 'idle', task: { error: 'Task deadline exceeded' } });
+    expect(value.entries.find(entry => entry.kind === 'tool')).toMatchObject({ label: 'read', status: 'completed', text: 'Read completed' });
+    expect(JSON.stringify(value)).not.toContain('PRIVATE'); expect(value.elapsedMs).not.toBeNull();
+    await stream.stop(); expect(h.rows.get('captain')).toEqual(before);
+    for (const fn of [h.createAgent, h.resolveAgent, h.driver.run, h.listModels, h.stream]) expect(fn).not.toHaveBeenCalled();
+  });
+  it('opens mid-stream with cached public text, follows new chunks, and replaces them with committed history', async () => {
+    const h = await activityFixture(); h.emit('turn/start', { turn: 1 }); h.emit('step/start', { turn: 1, step: 1 });
+    const id = LlmAttemptId('attempt');
+    h.host.emit('agent/assistant-stream', { agent: h.child, frame: { type: 'start', attemptId: id, revision: 1, turn: 1, step: 1 } });
+    h.host.emit('agent/assistant-stream', { agent: h.child, frame: { type: 'chunk', attemptId: id, revision: 2, index: 0, time: Date.now(), chunk: { type: 'text-delta', index: 0, text: 'Hello' } } });
+    h.host.emit('agent/assistant-stream', { agent: h.child, frame: { type: 'chunk', attemptId: id, revision: 3, index: 1, time: Date.now(), chunk: { type: 'reasoning-delta', index: 1, text: 'PRIVATE_REASONING' } } });
+    const stream = await h.open(); expect(await stream.next()).toMatchObject({ live: true, liveOutput: 'Hello', phase: 'model' });
+    const next = stream.next();
+    h.host.emit('agent/assistant-stream', { agent: h.child, frame: { type: 'chunk', attemptId: id, revision: 4, index: 2, time: Date.now(), chunk: { type: 'text-delta', index: 0, text: ' world' } } });
+    const update = (await next)!; expect(update.liveOutput).toBe('Hello world'); expect(JSON.stringify(update)).not.toContain('PRIVATE_REASONING');
+    const final = stream.next();
+    const event = h.emit('assistant/message', { message: { content: [{ type: 'text', text: 'Hello world' }] }, stream: [] });
+    h.host.emit('agent/assistant-stream', { agent: h.child, frame: { type: 'end', attemptId: id, revision: 5, index: 3, outcome: { kind: 'committed', eventType: 'assistant/message', seq: event.seq } } });
+    Object.assign(h.child, { status: 'idle' }); h.emit('turn/end', { reason: { kind: 'completed' } });
+    const value = (await final)!; expect(value.liveOutput).toBe(''); expect(value.status).toBe('completed');
+    expect(value.entries.filter(entry => entry.text === 'Hello world')).toHaveLength(1); await stream.stop();
+  });
+  it('does not lose or duplicate events published while the opening read awaits', async () => {
+    const h = await activityFixture(); h.emit('turn/start', { turn: 1 });
+    const before = [...h.log]; const gate = deferred<void>(); const entered = deferred<void>();
+    const original = h.inspect.getMockImplementation()!;
+    h.inspect.mockImplementation(async (id, signal) => {
+      if (id !== 'child') return original(id, signal);
+      entered.resolve(); await gate.promise;
+      return { meta: h.child.session.header, inheritedEventCount: 0, events: before };
+    });
+    const stream = await h.open(); const first = stream.next(); await entered.promise;
+    const event = h.emit('assistant/message', { message: { content: [{ type: 'text', text: 'Between snapshot and live' }] }, stream: [] });
+    gate.resolve(); const value = (await first)!;
+    expect(value.entries.filter(item => item.text === 'Between snapshot and live')).toHaveLength(1);
+    const second = stream.next(); h.host.emit('session/event', h.child.session, event);
+    expect((await second)!.entries.filter(item => item.text === 'Between snapshot and live')).toHaveLength(1);
+    await stream.stop();
+  });
+  it('coalesces many updates into bounded frames and releases observers when closed', async () => {
+    const h = await activityFixture(); const stream = await h.open(); await stream.next();
+    for (let i = 0; i < 200; i++) h.emit('assistant/message', { message: { content: [{ type: 'text', text: `output-${i} ${'中'.repeat(9000)}` }] }, stream: [] });
+    const value = (await stream.next())!;
+    expect(new TextEncoder().encode(JSON.stringify(value)).length).toBeLessThanOrEqual(192 * 1024);
+    expect(value.historyTruncated).toBe(true); expect(value.entries.at(-1)!.text).toContain('output-199');
+    await stream.stop();
+    const spy = vi.spyOn(h.engine, 'activityTarget');
+    h.emit('assistant/message', { message: { content: [{ type: 'text', text: 'After close' }] }, stream: [] });
+    expect(spy).not.toHaveBeenCalled(); expect(h.driver.run).not.toHaveBeenCalled();
+  });
+  it('rechecks archive authority even when no further member event arrives', async () => {
+    const h = await activityFixture(); const stream = await h.open(); await stream.next();
+    const pending = stream.next(); const rejected = expect(pending).rejects.toMatchObject({ code: 'team-agents/session-unavailable' });
+    h.archived.push(SessionId('captain'));
+    await rejected; await stream.stop(); expect(h.resolveAgent).not.toHaveBeenCalled();
+  });
+  it('closing one viewer leaves another viewer subscribed to the same member', async () => {
+    const h = await activityFixture(); const one = await h.open(); const two = await h.open();
+    await one.next(); await two.next(); await one.stop();
+    const next = two.next(); h.emit('assistant/message', { message: { content: [{ type: 'text', text: 'Still subscribed' }] }, stream: [] });
+    expect((await next)!.entries.some(entry => entry.text === 'Still subscribed')).toBe(true);
+    await two.stop(); expect(h.driver.run).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'wrong-parent', 'wrong-workspace', 'runtime-owner', 'archived'] as const)('fails closed for %s member ownership', async change => {
+    const h = await activityFixture();
+    if (change === 'missing') h.rows.get('captain')!.members.length = 0;
+    if (change === 'wrong-parent') h.actor('child', { parentSession: SessionId('other'), origin: 'subagent' });
+    if (change === 'wrong-workspace') h.actor('child', { parentSession: h.captain.id, origin: 'subagent', cwd: '/other' });
+    if (change === 'runtime-owner') h.runtimeChildren.delete('child');
+    if (change === 'archived') h.archived.push(SessionId('child'));
+    const stream = await h.open(); await expect(stream.next()).rejects.toThrow();
+    expect(h.resolveAgent).not.toHaveBeenCalled();
+  });
+  it('requires owner authorization even when a guest has a session-specific stream grant', async () => {
+    const h = await activityFixture();
+    await expect(h.open(undefined, h.guest)).rejects.toMatchObject({ code: 'remote-access/denied' });
+    h.host.remoteAccess.registerPolicy('team-transport-test', { bindings: () => [{ role: { name: 'inspect', resource: 'session', actions: [TEAM_REMOTE_ENDPOINTS.watchMember] }, resource: { kind: 'session', id: h.captain.id } }] });
+    const granted = await h.open(undefined, h.guest); await expect(granted.next()).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+    const direct = h.host.get('teamAgents').watchMember({ sessionId: 'captain', member: 'researcher' }, new AbortController().signal);
+    await expect(direct.next()).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+  });
+  it.each(['roster', 'archive', 'replace', 'unload'] as const)('ends an open stream after %s changes without leaking another frame', async change => {
+    const h = await activityFixture(); const stream = await h.open(); await stream.next();
+    const pending = stream.next(); const observed = pending.then(value => ({ value }), error => ({ error }));
+    if (change === 'roster') h.rows.get('captain')!.members[0]!.sessionId = 'another-child';
+    if (change === 'archive') h.archived.push(SessionId('captain'));
+    if (change === 'replace') h.actor('child', { parentSession: h.captain.id, origin: 'subagent' });
+    if (change === 'unload') await h.remoteFiber.dispose();
+    else h.host.emit('session/event', h.captain.session, { type: 'turn/start', data: { turn: 2 }, seq: 0, time: Date.now() } as SessionEvent);
+    const outcome = await observed;
+    expect('error' in outcome || outcome.value === undefined).toBe(true); await stream.stop();
   });
 });
 

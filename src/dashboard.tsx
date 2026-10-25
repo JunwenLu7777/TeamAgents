@@ -4,6 +4,7 @@ import type { TeamTranslate } from './locales.js';
 import type { TeamSettingsActions } from './settings-contract.js';
 import type { TeamRunExportFormat } from './run-export-contract.js';
 import { downloadTeamRunExport } from './run-export-download.js';
+import { MemberActivityPanel } from './member-activity-panel.js';
 
 export interface TeamDashboardProps {
   team: Team | null | undefined;
@@ -11,10 +12,11 @@ export interface TeamDashboardProps {
   canStop?: boolean;
   /** Affirmative export authority only; unknown remains denied and shows no download control. */
   canExport?: boolean;
+  canInspect?: boolean;
   /** The native conversation tab uses an expanded normal-flow page, not a composer disclosure. */
   presentation?: 'compact' | 'page';
   /** Stop stays required for existing consumers; export is optional read-only authority. */
-  actions?: Pick<TeamSettingsActions, 'stop'> & Partial<Pick<TeamSettingsActions, 'exportRun'>>;
+  actions?: Pick<TeamSettingsActions, 'stop'> & Partial<Pick<TeamSettingsActions, 'exportRun' | 'watchMember'>>;
   t: TeamTranslate;
 }
 
@@ -74,6 +76,8 @@ const styles = `
 .dsh-team-agents .dta-members { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 6px; }
 .dsh-team-agents .dta-member { padding: 8px 10px; min-width: 0; border-radius: 8px; background: var(--dta-fill); }
 .dsh-team-agents .dta-member-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; }
+.dsh-team-agents .dta-member-open { margin-top:8px; padding:5px 9px; font:inherit; font-size:11px; border:1px solid var(--dta-border); border-radius:6px; background:transparent; color:inherit; cursor:pointer; }
+.dsh-team-agents .dta-member-open:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
 .dsh-team-agents .dta-member-name { font-weight: 550; overflow-wrap: anywhere; }
 .dsh-team-agents .dta-member-role { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 11px; opacity: .72; }
 .dsh-team-agents .dta-task { border-top: 1px solid var(--dta-border); }
@@ -246,7 +250,7 @@ export function TeamDashboard(props: TeamDashboardProps) {
   return <TeamDashboardState key={`${sessionId ?? 'readonly'}:${team.id}`} {...props} team={team} />;
 }
 
-function TeamDashboardState({ team: projected, sessionId, canStop = false, canExport = false, presentation = 'compact', actions, t }: TeamDashboardProps & { team: Team }) {
+function TeamDashboardState({ team: projected, sessionId, canStop = false, canExport = false, canInspect = false, presentation = 'compact', actions, t }: TeamDashboardProps & { team: Team }) {
   const page = presentation === 'page';
   const Frame = page ? 'section' : 'details';
   const Header = page ? 'header' : 'summary';
@@ -254,11 +258,15 @@ function TeamDashboardState({ team: projected, sessionId, canStop = false, canEx
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stopResult, setStopResult] = useState<Team | null>(null);
+  const [selectedMember, setSelectedMember] = useState<string | null>(null);
   // A completed Stop can precede its projection. An older projection must not restore a running button.
   const team = stopResult && stopResult.revision > projected.revision ? stopResult : projected;
   const canManage = canStop && sessionId === team.ownerSessionId && !!actions;
   // Export needs affirmative authority, a bound session and the read-only action.
   const canDownload = canExport && !!sessionId && sessionId === team.ownerSessionId && !!actions?.exportRun;
+  const canViewMember = canInspect && !!sessionId && sessionId === team.ownerSessionId && !!actions?.watchMember;
+  const selected = canViewMember ? team.members.find(member => member.name === selectedMember) : undefined;
+  useEffect(() => { if (!canViewMember) setSelectedMember(null); }, [canViewMember]);
   useEffect(() => {
     setStopping(false); setError(null);
     return () => { request.current?.abort(); request.current = null; };
@@ -290,7 +298,8 @@ function TeamDashboardState({ team: projected, sessionId, canStop = false, canEx
 
   return <>
     <style>{styles}</style>
-    <Frame className={`dsh-team-agents${page ? ' dta-page' : ''}`} aria-label={t('panel.label', { name: team.name })}>
+    <Frame className={`dsh-team-agents${page ? ' dta-page' : ''}`} aria-label={t('panel.label', { name: team.name })}
+      onToggle={event => { if (!page && event.target === event.currentTarget && !(event.currentTarget as HTMLDetailsElement).open) setSelectedMember(null); }}>
       <Header className="dta-summary">
         <span className="dta-identity">
           <svg className="dta-symbol" width="17" height="17" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true" focusable="false">
@@ -319,16 +328,23 @@ function TeamDashboardState({ team: projected, sessionId, canStop = false, canEx
           <div className="dta-heading"><h3>{t('members.heading')}</h3><span className="dta-muted">{team.members.length}</span></div>
           {team.members.length ? <ul className="dta-members">{team.members.map(member => {
             const working = active.filter(task => task.assignee === member.name);
+            const last = team.tasks.filter(task => task.assignee === member.name && task.attempt > 0)
+              .sort((a, b) => (Date.parse(b.startedAt ?? '') || 0) - (Date.parse(a.startedAt ?? '') || 0))[0];
+            const memberStatus = working.length ? 'active' : last?.status === 'failed' ? 'failed' : last?.status === 'completed' ? 'completed' : 'idle';
             return <li className="dta-member" key={member.name}>
               <div className="dta-member-line">
                 <span className="dta-member-name">{member.name}</span>
-                <span className="dta-badge" data-status={working.length ? 'active' : 'idle'}>{t(working.length ? 'member.active' : 'member.idle')}</span>
+                <span className="dta-badge" data-status={memberStatus}>{t(memberStatus === 'active' ? 'member.active' : memberStatus === 'idle' ? 'member.idle' : `status.${memberStatus}`)}</span>
               </div>
               <p className="dta-member-role">{member.role}</p>
               <p className="dta-member-role">{member.model ? t('member.model', member.model) : t('member.inheritedModel')}</p>
               {working.length > 0 && <p className="dta-member-role">{t('member.tasks', { ids: working.map(task => task.id).join(', ') })}</p>}
+              {canViewMember && <button type="button" className="dta-member-open" aria-expanded={selectedMember === member.name}
+                onClick={() => setSelectedMember(value => value === member.name ? null : member.name)}>{t('activity.inspect', { name: member.name })}</button>}
             </li>;
           })}</ul> : <p className="dta-empty">{t('members.empty')}</p>}
+          {selected && sessionId && actions?.watchMember && <MemberActivityPanel ownerSessionId={sessionId} teamId={team.id}
+            member={selected} watch={actions.watchMember} t={t} onClose={() => setSelectedMember(null)} />}
         </section>
 
         <section className="dta-section" aria-label={t('tasks.heading')}>

@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-gateway/client';
 import { TeamModelOptionsSchema, TeamSchema } from './model.js';
 import type { TeamSettingsActions } from './settings-contract.js';
+import { MemberActivitySchema, MemberActivityRequestSchema, type MemberActivity } from './member-activity-contract.js';
 import {
   TeamRunExportDocumentSchema,
   TeamRunExportOptionsSchema,
@@ -85,12 +86,12 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
         return result.value;
       }
       // Export is a text envelope, not a Team; never funnel it through TeamSchema.
-      async function call<Action extends Exclude<TeamRemoteAction, 'models' | 'exportRun'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      async function call<Action extends Exclude<TeamRemoteAction, 'models' | 'exportRun' | 'watchMember'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const team = TeamSchema.nullable().parse(await invoke(action, request, signal));
         if (team && team.ownerSessionId !== boundId) throw new Error('Team settings received another captain session\'s state');
         return team;
       }
-      async function required<Action extends Exclude<TeamRemoteAction, 'read' | 'models' | 'exportRun'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      async function required<Action extends Exclude<TeamRemoteAction, 'read' | 'models' | 'exportRun' | 'watchMember'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const team = await call(action, request, signal);
         if (!team) throw new Error('Team settings mutation returned no saved team');
         return team;
@@ -102,6 +103,27 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
           { sessionId: boundId, ...normalized },
         );
       }
+      async function* watchMember(member: string, signal?: AbortSignal): AsyncGenerator<MemberActivity> {
+        const active = signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal;
+        active.throwIfAborted();
+        const request = MemberActivityRequestSchema.parse({ sessionId: boundId, member });
+        const method = TEAM_REMOTE.methods[TEAM_REMOTE_ENDPOINTS.watchMember];
+        if (!method || method.mode !== 'stream' || !mountedRemote) throw new Error('Member activity stream is unavailable');
+        const handle = method.invoke(mountedRemote, method.input({ strict: true }).create().parse({ request }), active);
+        let sequence = 0;
+        const cancel = () => handle.dispose();
+        active.addEventListener('abort', cancel, { once: true });
+        try {
+          active.throwIfAborted();
+          for await (const raw of handle) {
+            active.throwIfAborted();
+            const frame = MemberActivitySchema.parse(raw);
+            if (frame.ownerSessionId !== boundId || frame.member !== member || frame.sequence <= sequence) throw new Error('Member activity stream identity or sequence changed');
+            sequence = frame.sequence;
+            yield frame;
+          }
+        } finally { active.removeEventListener('abort', cancel); handle.dispose(); }
+      }
       // Every closure keeps this exact session id; switching tabs cannot retarget
       // an in-flight save, start, stop, retry, or export. Only the Host authorizes it.
       return Object.freeze({
@@ -111,7 +133,7 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
         start: (expectedRevision, signal) => required('start', { sessionId: boundId, expectedRevision }, signal),
         stop: (signal?: AbortSignal) => required('stop', { sessionId: boundId }, signal),
         retry: (taskId, expectedRevision, signal) => required('retry', { sessionId: boundId, taskId, expectedRevision }, signal),
-        exportRun,
+        exportRun, watchMember,
       } satisfies TeamSettingsActions);
     },
   };
