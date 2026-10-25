@@ -1,12 +1,12 @@
 import { z } from 'zod';
 import { createTypertRemoteInfo } from '@deepseek-ai/dsh-typert-protocol/remote-info';
 import type { RemoteResult, TypertRemoteCodecSpec, TypertRemoteMethodSpec, TypertRemoteNamespace } from '@deepseek-ai/dsh-typert-protocol';
-import { TeamPlanSchema, TeamSchema, taskId, type Team } from './model.js';
+import { TeamPlanSchema, TeamSchema, TeamModelOptionsSchema, taskId, type Team, type TeamModelOption } from './model.js';
 
 /** These are ACL action names, not new policies. Unrecognized actions remain default-deny. */
 export const TEAM_REMOTE_ENDPOINTS = {
   read: 'teamAgents/read', save: 'teamAgents/save', start: 'teamAgents/start',
-  stop: 'teamAgents/stop', retry: 'teamAgents/retry',
+  stop: 'teamAgents/stop', retry: 'teamAgents/retry', models: 'teamAgents/models',
 } as const;
 export type TeamRemoteAction = keyof typeof TEAM_REMOTE_ENDPOINTS;
 export const TEAM_REMOTE_SERVICE = 'teamAgents';
@@ -18,6 +18,7 @@ const revision = z.number().int().nonnegative();
 const address = z.strictObject({ sessionId: TeamSessionIdSchema });
 export const TeamRemoteRequests = {
   read: address,
+  models: address,
   save: address.extend({ plan: TeamPlanSchema, expectedRevision: revision.nullable() }),
   start: address.extend({ expectedRevision: revision }),
   stop: address,
@@ -41,7 +42,8 @@ function method(action: TeamRemoteAction, nullable = false): TypertRemoteMethodS
     service: TEAM_REMOTE_SERVICE, invocation: { kind: 'direct' },
     parameters: [{ name: 'request', source: 'json', codec: request, strictCodec: request }],
     cancellation: { parameter: 'signal' },
-    result: codec(nullable ? 'TeamOrNull' : 'Team', nullable ? TeamSchema.nullable() : TeamSchema),
+    result: action === 'models' ? codec('TeamModelOptions', TeamModelOptionsSchema)
+      : codec(nullable ? 'TeamOrNull' : 'Team', nullable ? TeamSchema.nullable() : TeamSchema),
   };
 }
 
@@ -50,6 +52,7 @@ export const TEAM_REMOTE = createTypertRemoteInfo({
   package: TEAM_REMOTE_PACKAGE,
   methods: {
     [TEAM_REMOTE_ENDPOINTS.read]: method('read', true),
+    [TEAM_REMOTE_ENDPOINTS.models]: method('models'),
     [TEAM_REMOTE_ENDPOINTS.save]: method('save'),
     [TEAM_REMOTE_ENDPOINTS.start]: method('start'),
     [TEAM_REMOTE_ENDPOINTS.stop]: method('stop'),
@@ -62,6 +65,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
   // mounted runtime methods above (also consumed by native useAccess()).
   interface TypertRemoteMap {
     'teamAgents/read': (request: TeamRemoteRequest<'read'>, signal?: AbortSignal) => Promise<RemoteResult<Team | null>>;
+    'teamAgents/models': (request: TeamRemoteRequest<'models'>, signal?: AbortSignal) => Promise<RemoteResult<TeamModelOption[]>>;
     'teamAgents/save': (request: TeamRemoteRequest<'save'>, signal?: AbortSignal) => Promise<RemoteResult<Team>>;
     'teamAgents/start': (request: TeamRemoteRequest<'start'>, signal?: AbortSignal) => Promise<RemoteResult<Team>>;
     'teamAgents/stop': (request: TeamRemoteRequest<'stop'>, signal?: AbortSignal) => Promise<RemoteResult<Team>>;
@@ -75,6 +79,8 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'team-agents/session-unavailable': {};
     'team-agents/workspace-mismatch': {};
     'team-agents/model-required': {};
+    'team-agents/model-unavailable': {};
+    'team-agents/model-catalog-unavailable': {};
     'team-agents/operation-rejected': {};
   }
 }

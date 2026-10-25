@@ -1,8 +1,15 @@
+import { useEffect, useRef, useState } from 'react';
 import type { Task, Team } from './model.js';
 import type { TeamTranslate } from './locales.js';
+import type { TeamSettingsActions } from './settings-contract.js';
 
 export interface TeamDashboardProps {
   team: Team | null | undefined;
+  sessionId?: string;
+  canStop?: boolean;
+  /** The native conversation tab uses an expanded normal-flow page, not a composer disclosure. */
+  presentation?: 'compact' | 'page';
+  actions?: Pick<TeamSettingsActions, 'stop'>;
   t: TeamTranslate;
 }
 
@@ -17,7 +24,7 @@ const styles = `
 }
 .dsh-team-agents *, .dsh-team-agents *::before, .dsh-team-agents *::after { box-sizing: border-box; }
 .dsh-team-agents summary { cursor: pointer; overflow-wrap: anywhere; }
-.dsh-team-agents summary:focus-visible, .dsh-team-agents [tabindex]:focus-visible {
+.dsh-team-agents summary:focus-visible, .dsh-team-agents [tabindex]:focus-visible, .dsh-team-agents button:focus-visible {
   outline: 2px solid currentColor; outline-offset: -3px; border-radius: 8px;
 }
 .dsh-team-agents .dta-summary {
@@ -85,7 +92,20 @@ const styles = `
 .dsh-team-agents .dta-message-header time { margin-inline-start: auto; opacity: .72; }
 .dsh-team-agents .dta-message-text { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7rem; overflow: auto; }
 .dsh-team-agents .dta-footer { padding: 8px 12px; border-top: 1px solid var(--dta-border); }
+.dsh-team-agents .dta-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.dsh-team-agents .dta-stop { min-height: 32px; padding: 4px 10px; border: 1px solid var(--dta-border); border-radius: 7px; background: var(--dta-fill); color: inherit; font: inherit; cursor: pointer; }
+.dsh-team-agents .dta-stop:disabled { opacity: .6; cursor: wait; }
+.dsh-team-agents .dta-error { margin: 8px 0 0; overflow-wrap: anywhere; }
+.dsh-team-agents.dta-page { margin: 0; font-size: 13px; }
+.dsh-team-agents.dta-page > .dta-summary { padding: 18px 20px; }
+.dsh-team-agents.dta-page .dta-name { font-size: 1.05rem; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+.dsh-team-agents.dta-page .dta-body { max-height: none; overflow: visible; overscroll-behavior: auto; padding: 20px; }
+.dsh-team-agents.dta-page .dta-members { grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: 10px; }
+.dsh-team-agents.dta-page .dta-member { padding: 12px; }
+.dsh-team-agents.dta-page .dta-section { margin-top: 24px; }
 @media (max-width: 420px) {
+  .dsh-team-agents.dta-page .dta-identity { flex-basis: 100%; }
+  .dsh-team-agents.dta-page .dta-meta { margin-inline-start: 0; }
   .dsh-team-agents .dta-summary { padding: 8px 10px; gap: 4px; }
   .dsh-team-agents .dta-body { padding: 10px; }
   .dsh-team-agents .dta-facts { grid-template-columns: minmax(0, 1fr); gap: 3px; }
@@ -111,8 +131,44 @@ function pendingReason(team: Team, task: Task, tasks: ReadonlyMap<string, Task>,
   return t('pending.ready');
 }
 
-export function TeamDashboard({ team, t }: TeamDashboardProps) {
-  if (!team) return null;
+export function TeamDashboard(props: TeamDashboardProps) {
+  const { team, sessionId } = props;
+  if (!team || (sessionId !== undefined && team.ownerSessionId !== sessionId)) return null;
+  // Switching sessions/teams unmounts the request owner even if a caller forgets a React key.
+  return <TeamDashboardState key={`${sessionId ?? 'readonly'}:${team.id}`} {...props} team={team} />;
+}
+
+function TeamDashboardState({ team: projected, sessionId, canStop = false, presentation = 'compact', actions, t }: TeamDashboardProps & { team: Team }) {
+  const page = presentation === 'page';
+  const Frame = page ? 'section' : 'details';
+  const Header = page ? 'header' : 'summary';
+  const request = useRef<AbortController | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [stopResult, setStopResult] = useState<Team | null>(null);
+  // A completed Stop can precede its projection. An older projection must not restore a running button.
+  const team = stopResult && stopResult.revision > projected.revision ? stopResult : projected;
+  const canManage = canStop && sessionId === team.ownerSessionId && !!actions;
+  useEffect(() => {
+    setStopping(false); setError(null);
+    return () => { request.current?.abort(); request.current = null; };
+  }, [actions, canStop]);
+
+  async function stop() {
+    if (!canManage || team.status !== 'running' || !actions || request.current) return;
+    const controller = new AbortController();
+    request.current = controller; setStopping(true); setError(null);
+    try {
+      const result = await actions.stop(controller.signal);
+      if (controller.signal.aborted) return;
+      if (result.id !== team.id || result.ownerSessionId !== sessionId) throw new Error(t('team.stopMismatch'));
+      setStopResult(current => current && current.revision > result.revision ? current : result);
+    } catch (failure) {
+      if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : t('team.stopUnknown'));
+    } finally {
+      if (request.current === controller) { request.current = null; setStopping(false); }
+    }
+  }
 
   const tasksById = new Map(team.tasks.map(task => [task.id, task]));
   const active = team.tasks.filter(task => task.status === 'running');
@@ -124,22 +180,22 @@ export function TeamDashboard({ team, t }: TeamDashboardProps) {
 
   return <>
     <style>{styles}</style>
-    <details className="dsh-team-agents" aria-label={t('panel.label', { name: team.name })}>
-      <summary className="dta-summary">
+    <Frame className={`dsh-team-agents${page ? ' dta-page' : ''}`} aria-label={t('panel.label', { name: team.name })}>
+      <Header className="dta-summary">
         <span className="dta-identity">
           <svg className="dta-symbol" width="17" height="17" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true" focusable="false">
             <circle cx="10" cy="4" r="2.3" /><circle cx="4" cy="15" r="2.3" /><circle cx="16" cy="15" r="2.3" />
             <path d="M9 6 5 13M11 6l4 7M6.3 15h7.4" />
           </svg>
-          <span className="dta-name" title={team.name}>{team.name}</span>
+          <span className="dta-name" title={team.name} role={page ? 'heading' : undefined} aria-level={page ? 2 : undefined}>{team.name}</span>
           <Badge status={team.status} t={t} />
         </span>
         <span className="dta-meta">
           <span className="dta-revision">{t('team.revision', { revision: team.revision })}</span>
           <span className="dta-progress-label">{t('progress.compact', { completed, total: team.tasks.length })}</span>
-          <svg className="dta-chevron" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true" focusable="false"><path d="m4.5 2.5 3.5 3.5-3.5 3.5" /></svg>
+          {!page && <svg className="dta-chevron" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true" focusable="false"><path d="m4.5 2.5 3.5 3.5-3.5 3.5" /></svg>}
         </span>
-      </summary>
+      </Header>
       <div className="dta-body" role="region" aria-label={t('panel.details')} tabIndex={0}>
         <progress className="dta-progress" value={completed} max={Math.max(1, team.tasks.length)} aria-label={t('progress.label', { completed, total: team.tasks.length })} />
         <div className="dta-counts">
@@ -147,7 +203,7 @@ export function TeamDashboard({ team, t }: TeamDashboardProps) {
           <span>{t('progress.pending', { count: pending })}</span>
           <span>{t('progress.failed', { count: failed })}</span>
         </div>
-        <details className="dta-goal"><summary>{t('team.goal')}</summary><p className="dta-prose">{team.goal}</p></details>
+        <details className="dta-goal" open={page || undefined}><summary>{t('team.goal')}</summary><p className="dta-prose">{team.goal}</p></details>
 
         <section className="dta-section" aria-label={t('members.heading')}>
           <div className="dta-heading"><h3>{t('members.heading')}</h3><span className="dta-muted">{team.members.length}</span></div>
@@ -159,6 +215,7 @@ export function TeamDashboard({ team, t }: TeamDashboardProps) {
                 <span className="dta-badge" data-status={working.length ? 'active' : 'idle'}>{t(working.length ? 'member.active' : 'member.idle')}</span>
               </div>
               <p className="dta-member-role">{member.role}</p>
+              <p className="dta-member-role">{member.model ? t('member.model', member.model) : t('member.inheritedModel')}</p>
               {working.length > 0 && <p className="dta-member-role">{t('member.tasks', { ids: working.map(task => task.id).join(', ') })}</p>}
             </li>;
           })}</ul> : <p className="dta-empty">{t('members.empty')}</p>}
@@ -197,7 +254,16 @@ export function TeamDashboard({ team, t }: TeamDashboardProps) {
           </li>)}</ol> : <p className="dta-empty">{t('messages.empty')}</p>}
         </section>
       </div>
-      <div className="dta-footer"><p className="dta-hint">{t('team.chatHint')}</p></div>
-    </details>
+      <div className="dta-footer">
+        <div className="dta-controls">
+          <p className="dta-hint">{t('team.chatHint')}</p>
+          {canManage && (team.status === 'running' || stopping) && <button type="button" className="dta-stop"
+            disabled={stopping || team.status !== 'running'} onClick={() => { void stop(); }}>
+            {t(stopping ? 'team.stopping' : 'team.stop')}
+          </button>}
+        </div>
+        {error && <p className="dta-error" role="alert">{t('team.stopError', { message: error })}</p>}
+      </div>
+    </Frame>
   </>;
 }

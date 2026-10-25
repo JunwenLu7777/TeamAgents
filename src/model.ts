@@ -7,7 +7,19 @@ export const scopePath = z.string().min(1).max(300).refine(path =>
   path === '.' || (!path.startsWith('/') && !path.includes('\\') && !path.split('/').some(p => p === '..' || p === '.' || p === '')),
 'Write scopes must be normalized workspace-relative POSIX paths (or .)');
 
-export const memberInput = z.strictObject({ name: memberName, role: text, instructions: text.optional() });
+// Provider/model ids are opaque host routes; never normalize them into a different route.
+const modelId = z.string().min(1).max(1024).refine(value => value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value), 'Invalid model route id');
+export const TeamModelSelectionSchema = z.strictObject({ provider: modelId, model: modelId });
+export type TeamModelSelection = z.infer<typeof TeamModelSelectionSchema>;
+export const TeamModelOptionSchema = TeamModelSelectionSchema.extend({
+  providerLabel: z.string().min(1).max(2000), modelLabel: z.string().min(1).max(2000),
+});
+export const TeamModelOptionsSchema = z.array(TeamModelOptionSchema);
+export type TeamModelOption = z.infer<typeof TeamModelOptionSchema>;
+
+export const memberInput = z.strictObject({
+  name: memberName, role: text, instructions: text.optional(), model: TeamModelSelectionSchema.optional(),
+});
 export const taskInput = z.strictObject({
   id: taskId, subject: z.string().trim().min(1).max(200), description: text,
   assignee: memberName, dependencies: z.array(taskId).max(100).default([]),
@@ -59,7 +71,9 @@ export type TeamPlan = z.infer<typeof TeamPlanSchema>;
 export function planOf(team: Team): TeamPlan {
   return {
     name: team.name, goal: team.goal, maxConcurrency: team.maxConcurrency,
-    members: team.members.map(({ name, role, instructions }) => ({ name, role, ...(instructions === undefined ? {} : { instructions }) })),
+    members: team.members.map(({ name, role, instructions, model }) => ({
+      name, role, ...(instructions === undefined ? {} : { instructions }), ...(model === undefined ? {} : { model: { ...model } }),
+    })),
     tasks: team.tasks.map(({ id, subject, description, assignee, dependencies, writeScopes }) => ({
       id, subject, description, assignee, dependencies: [...dependencies], writeScopes: [...writeScopes],
     })),

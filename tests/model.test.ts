@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   blockingReason, createInput, memberInput, memberName, scopePath, scopesOverlap,
-  taskId, taskInput, taskPatch, TeamSchema, validateGraph, type Task, type Team,
+  taskId, taskInput, taskPatch, TeamSchema, TeamModelOptionSchema, validateGraph, type Task, type Team,
 } from '../src/model.js';
 
 const timestamp = '2026-10-23T00:00:00.000Z';
@@ -33,6 +33,28 @@ describe('input schemas', () => {
       .toEqual({ name: 'alice', role: 'Engineer', instructions: 'Check tests' });
     expect(taskInput.parse({ id: 'task-1', subject: '  Work  ', description: '  Details  ', assignee: 'alice' }))
       .toEqual({ id: 'task-1', subject: 'Work', description: 'Details', assignee: 'alice', dependencies: [], writeScopes: [] });
+  });
+
+  it('keeps legacy members inherited and round-trips explicit opaque route ids', () => {
+    const legacy = TeamSchema.parse(team());
+    expect(legacy.members[0]).not.toHaveProperty('model');
+    const model = { provider: 'configured-gateway', model: 'org/model:preview' };
+    const explicit = memberInput.parse({ name: 'alice', role: 'Engineer', model });
+    expect(explicit.model).toEqual(model);
+    expect(TeamSchema.parse(team([], { members: [explicit] })).members[0]!.model).toEqual(model);
+  });
+
+  it.each([null, {}, { provider: 'p' }, { provider: '', model: 'm' }, { provider: 'p', model: ' ' },
+    { provider: ' p', model: 'm' }, { provider: 'p', model: 'm\n' },
+    { provider: 'p', model: 'm', apiKey: 'not-accepted' }, { provider: 'p', model: 'm', reasoningEffort: 'high' }])
+    ('rejects malformed or expanded member model selection %#', model => {
+      expect(memberInput.safeParse({ name: 'alice', role: 'Engineer', model }).success).toBe(false);
+    });
+
+  it('keeps browser model options on a strict four-field allowlist', () => {
+    const option = { provider: 'p', model: 'm', providerLabel: 'Provider', modelLabel: 'Model' };
+    expect(TeamModelOptionSchema.parse(option)).toEqual(option);
+    expect(TeamModelOptionSchema.safeParse({ ...option, apiKey: 'not-accepted' }).success).toBe(false);
   });
 
   it.each([0, 9, 1.5, Number.NaN])('rejects invalid maxConcurrency %s', maxConcurrency => {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Context } from '@deepseek-ai/cordis';
-import type { Agent, AgentHandle, CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent';
-import { createAssistantMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
+import type { Agent, AgentHandle, AgentOptions, CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent';
+import { createAssistantMessage, ReasoningEffortId, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { Session, SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session';
 import { DshTeamDriver, taskPrompt } from '../src/runtime.js';
 import { TeamSchema, type TeamMessage } from '../src/model.js';
@@ -26,14 +26,16 @@ function fixture() {
     permissionPresets: { current: () => 'danger-full-access' },
     sandboxPolicy: { overrideOf: () => 'workspace-write' }, approval: {},
   };
+  const scopedListeners = new Map<string, Function>();
   const childCtx = {
+    on: (name: string, callback: Function) => { scopedListeners.set(name, callback); return () => scopedListeners.delete(name); },
     get: (name: string) => services[name],
     tools: { guard: (guard: typeof guards[number]) => guards.push(guard), get: () => toolDefinition },
     systemPrompt: { context: vi.fn(), getContextOrder: () => 125 },
   } as unknown as Context;
   class FakeAgent {
     status: 'idle' | 'running' = 'idle';
-    options = { provider: 'test-provider', model: 'test-model' };
+    options: AgentOptions = { provider: 'test-provider', model: 'test-model' };
     ctx = childCtx;
     idle = deferred();
     turn = 0;
@@ -70,8 +72,8 @@ function fixture() {
   live.set(parent.id, parent);
   let configure: (agent: FakeAgent) => void = () => {};
   const disposers: ReturnType<typeof vi.fn>[] = [];
-  async function materialize(session: Session, setup: CreateAgentOptions['setup']) {
-    const agent = new FakeAgent(session); configure(agent);
+  async function materialize(session: Session, setup: CreateAgentOptions['setup'], options: AgentOptions = {}) {
+    const agent = new FakeAgent(session); agent.options = options; configure(agent);
     await setup?.(childCtx, agent as unknown as Agent);
     saved.set(agent.id, session); live.set(agent.id, agent);
     const dispose = vi.fn(async () => { agent.cancel(); await agent.whenIdle(); live.delete(agent.id); });
@@ -80,13 +82,18 @@ function fixture() {
   }
   const create = vi.fn(async (options: CreateAgentOptions) => materialize(Session.create(options.sessionId, undefined, {
     version: 4, id: options.sessionId, createdAt: Date.now(), isSeeded: false, ...options.meta,
-  }), options.setup));
+  }), options.setup, options.agentOptions));
   const resume = vi.fn(async (options: ResumeAgentOptions) => {
     const session = saved.get(options.resumeSessionId);
     if (!session) throw new Error('Missing persisted member');
-    return materialize(session, options.setup);
+    return materialize(session, options.setup, options.agentOptions);
   });
+  const listModels = vi.fn(async (provider: string) => [
+    { provider, id: 'member-model', name: 'Member model' }, { provider, id: 'test-model', name: 'Test model' },
+  ]);
+  const llm = { listProviders: () => [{ id: 'member-provider', name: 'Member provider' }, { id: 'test-provider', name: 'Test provider' }], listModels };
   const ctx = {
+    llm,
     agents: { get: (id: string) => live.get(id), create, resume },
     on: (_name: string, fn: typeof listeners extends Set<infer F> ? F : never) => {
       listeners.add(fn); return () => { listeners.delete(fn); };
@@ -103,7 +110,7 @@ function fixture() {
   const bindSession = vi.fn(async (id: string) => { team.members[0]!.sessionId = id; bound.resolve(); });
   const execution: Execution = { team, member: team.members[0]!, task: team.tasks[0]!, signal: controller.signal, bindSession };
   const driver = new DshTeamDriver(ctx);
-  return { driver, execution, team, parent, live, saved, create, resume, guards, composeFrom, childCtx,
+  return { driver, execution, team, parent, live, saved, create, resume, guards, composeFrom, childCtx, ctx, llm, scopedListeners,
     configure: (fn: typeof configure) => { configure = fn; }, controller, bound, listeners, disposers, setDirectory };
 }
 
@@ -142,6 +149,72 @@ describe('DSH runtime adapter using real delegation and output helpers', () => {
     expect(h.resume.mock.calls[0]![0].resumeSessionId).toBe(id);
     expect(h.create).toHaveBeenCalledOnce();
     await newDriver.dispose();
+  });
+  it('keeps explicit member routing on create, reuse, and resume regardless of captain changes', async () => {
+    const h = fixture();
+    const selected = { provider: 'member-provider', model: 'member-model' };
+    h.execution.member.model = selected;
+    h.parent.options = { provider: 'test-provider', model: 'test-model', reasoningEffort: ReasoningEffortId('captain-effort') };
+    await h.driver.run(h.execution);
+    expect(h.create.mock.calls[0]![0].agentOptions).toMatchObject(selected);
+    expect(h.create.mock.calls[0]![0].agentOptions).not.toHaveProperty('reasoningEffort');
+    h.parent.options = { provider: 'other-provider', model: 'other-model' };
+    await h.driver.run(h.execution);
+    expect(h.create).toHaveBeenCalledOnce(); expect(h.resume).not.toHaveBeenCalled();
+    await h.driver.dispose();
+    const resumed = new DshTeamDriver(h.ctx);
+    await resumed.run(h.execution);
+    expect(h.resume.mock.calls[0]![0].agentOptions).toMatchObject(selected);
+    expect(h.resume.mock.calls[0]![0].agentOptions).not.toHaveProperty('reasoningEffort');
+    expect(h.llm.listModels).toHaveBeenCalledTimes(3);
+    await resumed.dispose();
+  });
+  it('uses the real SDK selection hook for prompt/request routing and clears resumed effort', async () => {
+    const h = fixture(); h.execution.member.model = { provider: 'test-provider', model: 'test-model' };
+    await h.driver.run(h.execution);
+    // Drive the actual installModelSelection waterfalls without invoking a provider or Agent loop.
+    const assembly = h.scopedListeners.get('system-prompt/assemble')!;
+    const request = h.scopedListeners.get('agent/request')!;
+    expect(await assembly({}, {}, async () => ({ variables: { provider: 'old', model: 'old' } }))).toMatchObject({
+      variables: { provider: 'test-provider', model: 'test-model' },
+    });
+    const staleRequest = { provider: 'old', model: 'old', reasoningEffort: ReasoningEffortId('old-effort'), maxTokens: 4096 };
+    expect(await request({}, async () => staleRequest)).toEqual({ provider: 'test-provider', model: 'test-model', maxTokens: 4096 });
+    // Omission also clears effort when the old header names the very same route.
+    expect(await request({}, async () => ({ ...staleRequest, provider: 'test-provider', model: 'test-model' })))
+      .not.toHaveProperty('reasoningEffort');
+    await h.driver.dispose();
+  });
+  it('independently routes two members without requiring a configured captain', async () => {
+    const h = fixture(); h.parent.options = {};
+    h.execution.member.model = { provider: 'member-provider', model: 'member-model' };
+    await h.driver.run(h.execution);
+    const other = { name: 'reviewer', role: 'Review', model: { provider: 'test-provider', model: 'test-model' } };
+    h.team.members.push(other);
+    await h.driver.run({ ...h.execution, member: other, bindSession: async () => {} });
+    expect(h.create.mock.calls.map(([options]) => options.agentOptions)).toMatchObject([
+      { provider: 'member-provider', model: 'member-model' }, { provider: 'test-provider', model: 'test-model' },
+    ]);
+    await h.driver.dispose();
+  });
+  it('rejects removed models both before creation and before reuse rather than falling back', async () => {
+    const h = fixture(); h.execution.member.model = { provider: 'member-provider', model: 'member-model' };
+    h.llm.listModels.mockResolvedValueOnce([]);
+    await expect(h.driver.run(h.execution)).rejects.toThrow('no longer');
+    expect(h.create).not.toHaveBeenCalled();
+    await h.driver.run(h.execution);
+    const child = h.live.get(h.execution.member.sessionId!)!;
+    h.llm.listModels.mockResolvedValue([]);
+    await expect(h.driver.run(h.execution)).rejects.toThrow('no longer');
+    expect(child.followup).toHaveBeenCalledOnce();
+    await h.driver.dispose();
+  });
+  it('refuses silently reusing a handle after its explicit plan selection changes', async () => {
+    const h = fixture(); h.execution.member.model = { provider: 'member-provider', model: 'member-model' };
+    await h.driver.run(h.execution);
+    h.execution.member.model = { provider: 'test-provider', model: 'test-model' };
+    await expect(h.driver.run(h.execution)).rejects.toThrow('selection changed');
+    expect(h.create).toHaveBeenCalledOnce(); await h.driver.dispose();
   });
   it('rebinds a retained idle handle after a state write failure', async () => {
     const h = fixture();

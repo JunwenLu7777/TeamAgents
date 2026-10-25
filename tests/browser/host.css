@@ -1,0 +1,22 @@
+/* Deliberately no global border-box reset: the plugin must own its box model.
+ * This is the verified host's sizing/scroll contract, not a copy of Desktop UI. */
+html, body { margin: 0; height: 100%; }
+html { font-size: 16px; }
+body { display: flex; align-items: center; justify-content: center; background: #edf0f6; color: #202531; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
+body[data-theme="dark"] { background: #111318; color: #e7eaf1; color-scheme: dark; }
+/* Observed 1280x820 host geometry: 800x684 panel at (240, 68), with a 176px navigation rail. */
+#host-panel { display: flex; width: min(800px, calc(100vw - 32px)); height: min(684px, calc(100vh - 32px)); background: #fff; border-radius: 16px; box-shadow: 0 10px 40px #16223c1a; overflow: hidden; }
+#host-nav { flex: 0 0 176px; min-width: 0; box-sizing: border-box; padding: 22px 16px; background: #f5f6f9; overflow-wrap: anywhere; }
+#host-nav strong { display: block; font-size: .9rem; margin-bottom: 20px; }
+#host-nav span { display: block; padding: 8px; margin: 4px 0; border-radius: 8px; font-size: .75rem; }
+#host-nav .active { background: #4d6bfe12; color: #4d6bfe; font-weight: 600; }
+body[data-theme="dark"] #host-nav { background: #171a21; }
+@media (max-width: 700px) { #host-nav { display: none; } }
+body[data-theme="dark"] #host-panel { background: #1c1f27; box-shadow: 0 10px 40px #0006; }
+#host-content { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+#host-header { flex: none; padding: 18px 24px; font-size: .9rem; font-weight: 600; overflow-wrap: anywhere; }
+#host-header small { display: block; font-size: .68rem; font-weight: 400; opacity: .6; }
+#host-options { flex: 1; min-height: 0; overflow-y: auto; padding: 0 24px 24px; }
+#host-slot { display: contents; }
+body[data-font-scale="2"] { font-size: 28px; }
+html:has(body[data-font-scale="2"]) { font-size: 32px; }

@@ -2,12 +2,13 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { SessionId, type Session, type SessionHeader } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
-import { resolveTeamAgentOptions } from './model-route.js';
+import { requireInheritedTeamModel } from './model-route.js';
+import { TeamModelError, listTeamModels, validateTeamModels } from './model-catalog.js';
 import { Remote, RemoteError, TypertRemoteService, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol';
 import type {} from '@deepseek-ai/dsh-typert-registry';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type { TeamEngine } from './engine.js';
-import type { Team } from './model.js';
+import type { Team, TeamModelOption } from './model.js';
 import {
   TEAM_REMOTE, TEAM_REMOTE_PACKAGE, TEAM_REMOTE_SERVICE, TeamRemoteRequests,
   type TeamRemoteAction, type TeamRemoteRequest,
@@ -91,7 +92,7 @@ class TeamRemoteService extends TypertRemoteService {
     check();
     if (!workspace) throw new RemoteError('team-agents/workspace-mismatch', 'The captain workspace is not currently registered in DSH.', {});
     return {
-      owner: id, workspaceId: workspace.id, check,
+      owner: id, workspaceId: workspace.id, check, signal: active,
       acceptLive: (agent: Agent) => {
         if (initialAgent && initialAgent !== agent) throw unavailable();
         const liveCheck = () => { assertCurrent(agent, agent.session); root(agent.session.header); };
@@ -105,6 +106,7 @@ class TeamRemoteService extends TypertRemoteService {
     try { return await action(); }
     catch (error) {
       if (remoteErrorOf(error)) throw error;
+      if (error instanceof TeamModelError) throw new RemoteError(error.code, error.message, {});
       // Keep actionable engine CAS/plan diagnostics on the native failure face.
       // Gateway cancellation takes precedence if the carrier was cancelled.
       throw new RemoteError('team-agents/operation-rejected', error instanceof Error ? error.message : 'Team operation failed.', {}, { cause: error });
@@ -120,11 +122,25 @@ class TeamRemoteService extends TypertRemoteService {
   }
 
   @Remote({ resources: { session: sessionResource } })
+  async models(request: TeamRemoteRequest<'models'>, signal: AbortSignal): Promise<TeamModelOption[]> {
+    const input = TeamRemoteRequests.models.parse(request);
+    const captain = await this.captain('models', input.sessionId, signal);
+    return this.operation(async () => {
+      const models = await listTeamModels(this.ctx, captain.signal);
+      captain.check();
+      return models;
+    });
+  }
+
+  @Remote({ resources: { session: sessionResource } })
   async save(request: TeamRemoteRequest<'save'>, signal: AbortSignal): Promise<Team> {
     const input = TeamRemoteRequests.save.parse(request);
     const captain = await this.captain('save', input.sessionId, signal);
-    captain.check();
-    return this.operation(() => this.engine.savePlan(captain.owner, captain.workspaceId, input.expectedRevision, input.plan));
+    return this.operation(async () => {
+      await validateTeamModels(this.ctx, input.plan.members, captain.signal);
+      captain.check();
+      return this.engine.savePlan(captain.owner, captain.workspaceId, input.expectedRevision, input.plan);
+    });
   }
 
   @Remote({ resources: { session: sessionResource } })
@@ -136,15 +152,18 @@ class TeamRemoteService extends TypertRemoteService {
     if (saved.revision !== input.expectedRevision) {
       throw new RemoteError('team-agents/operation-rejected', 'Plan changed. Reload and approve the current saved revision.', {});
     }
-    captain.check();
-    // Only an explicit authenticated Start can materialize a cold root. This
-    // public API composes the ordinary Session; it never fabricates a prompt.
-    const resolved = await this.ctx.sessionController.resolveAgent(captain.owner);
-    if ('error' in resolved) { captain.check(); throw resolved.error; }
-    const checkLive = captain.acceptLive(resolved.agent);
-    this.requireModel(resolved.agent);
-    checkLive();
-    return this.operation(() => this.engine.start(captain.owner, input.expectedRevision));
+    return this.operation(async () => {
+      await validateTeamModels(this.ctx, saved.members, captain.signal);
+      captain.check();
+      // Only an explicit authenticated Start can materialize a cold root. This
+      // public API composes the ordinary Session; it never fabricates a prompt.
+      const resolved = await this.ctx.sessionController.resolveAgent(captain.owner);
+      if ('error' in resolved) { captain.check(); throw resolved.error; }
+      const checkLive = captain.acceptLive(resolved.agent);
+      requireInheritedTeamModel(this.ctx, resolved.agent, saved);
+      checkLive();
+      return this.engine.start(captain.owner, input.expectedRevision);
+    });
   }
 
   @Remote({ resources: { session: sessionResource } })
@@ -161,14 +180,5 @@ class TeamRemoteService extends TypertRemoteService {
     const captain = await this.captain('retry', input.sessionId, signal);
     captain.check();
     return this.operation(() => this.engine.retry(captain.owner, input.taskId, input.expectedRevision));
-  }
-
-  private requireModel(agent: Agent): void {
-    // Identical configured/session selection to DshTeamDriver, without inventing
-    // a route, contacting a provider, starting a turn, or invoking any tool.
-    const route = resolveTeamAgentOptions(this.ctx, agent, 1);
-    if (!route.provider?.trim() || !route.model?.trim()) {
-      throw new RemoteError('team-agents/model-required', 'The captain has no resolved model. Select a model in its conversation settings, then start the saved team again. No message is required.', {});
-    }
   }
 }

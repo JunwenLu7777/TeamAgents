@@ -48,6 +48,18 @@ describe('visual plan boundary', () => {
     expect(planOf(result)).toEqual(plan);
     await engine.dispose();
   });
+  it('persists explicit member models and copies them without exposing runtime ids', async () => {
+    const { engine, driver } = setup(); const input = draft();
+    input.members[0]!.model = { provider: 'p', model: 'm' };
+    const result = await engine.savePlan('captain', 'workspace', null, input);
+    expect(result.members[0]!.model).toEqual({ provider: 'p', model: 'm' });
+    const editable = planOf(result);
+    editable.members[0]!.model!.model = 'different';
+    expect(result.members[0]!.model!.model).toBe('m');
+    expect(engine.snapshot('captain')!.members[0]!.model!.model).toBe('m');
+    expect(driver.run).not.toHaveBeenCalled();
+    await engine.dispose();
+  });
   it('rejects a stale save instead of overwriting another tab or chat edit', async () => {
     const { engine, table } = setup(seed());
     await expect(engine.savePlan('captain', 'workspace', 3, draft())).rejects.toThrow('Plan changed');

@@ -2,18 +2,31 @@ import { describe, expect, it } from 'vitest';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { resolveTeamAgentOptions } from '../src/model-route.js';
+import type { TeamModelSelection } from '../src/model.js';
 
 type Route = { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number };
-function resolve({ pending = null, header, defaults, options = {} }: {
+function resolve({ pending = null, header, defaults, options = {}, selected }: {
   pending?: Route | null; header?: { config: Route; adapterDefaults?: { reasoningEffort?: boolean } }; defaults?: Route; options?: Route;
+  selected?: TeamModelSelection;
 }) {
   const parent = { options: Object.freeze(options), session: { requestHeader: () => header } } as unknown as Agent;
   const ctx = { sessionProjections: { stateOf: () => ({ pending }) },
     ...(defaults ? { agentDefaultModel: { currentSelection: () => defaults } } : {}) } as unknown as Context;
-  return resolveTeamAgentOptions(ctx, parent, 1);
+  return resolveTeamAgentOptions(ctx, parent, 1, selected);
 }
 
 describe('GUI route inheritance without a dummy model request', () => {
+  it.each([{ provider: 'member', model: 'independent' }, { provider: 'captain', model: 'same' }])
+    ('prioritizes explicit selection and removes inherited effort even on the same route: %j', selected => {
+      expect(resolve({ selected, pending: { provider: 'pending', model: 'changed', reasoningEffort: 'high' },
+        header: { config: { provider: 'captain', model: 'same', reasoningEffort: 'high' } },
+        defaults: { provider: 'default', model: 'default', reasoningEffort: 'high' },
+        options: { provider: 'captain', model: 'same', reasoningEffort: 'high', maxTokens: 4096 },
+      })).toEqual({ ...selected, maxTokens: 4096, subagentDepth: 1 });
+    });
+  it('resolves a fully explicit member without any captain route or global default', () => {
+    expect(resolve({ selected: { provider: 'member', model: 'independent' } })).toEqual({ provider: 'member', model: 'independent', subagentDepth: 1 });
+  });
   it('uses pending model selection instead of the old request or constructor options', () => {
     expect(resolve({ pending: { provider: 'chosen', model: 'new' },
       header: { config: { provider: 'old', model: 'old', reasoningEffort: 'high' } },

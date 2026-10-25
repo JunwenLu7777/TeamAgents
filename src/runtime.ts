@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
-import { foldConsumedWork, type Agent, type AgentHandle } from '@deepseek-ai/dsh-agent';
+import { foldConsumedWork, installModelSelection, type Agent, type AgentHandle } from '@deepseek-ai/dsh-agent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session';
 import {
@@ -10,8 +10,9 @@ import {
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-working-directory';
 import type { Execution, TeamDriver } from './engine.js';
-import type { Team, TeamMessage, Task } from './model.js';
+import type { Team, TeamMessage, Task, TeamModelSelection } from './model.js';
 import { resolveTeamAgentOptions } from './model-route.js';
+import { TeamModelError, validateTeamModels } from './model-catalog.js';
 
 declare module '@deepseek-ai/dsh-llm/types' {
   interface MessageSourceMap { 'team-agents': { kind: 'team-agents'; sender: string }; }
@@ -42,7 +43,7 @@ export function taskPrompt({ team, member, task }: Pick<Execution, 'team' | 'mem
 
 /** Uses the public 0.2.1 Agent factory and official delegation policy/composition helpers. */
 export class DshTeamDriver implements TeamDriver {
-  private handles = new Map<string, AgentHandle>();
+  private handles = new Map<string, { handle: AgentHandle; selected?: TeamModelSelection }>();
   private disposed = false;
   onMailboxDelivered?: (owner: string, ids: string[]) => Promise<void>;
   constructor(private ctx: Context) {}
@@ -55,18 +56,35 @@ export class DshTeamDriver implements TeamDriver {
   private async member(execution: Execution): Promise<Agent> {
     if (this.disposed) throw new Error('Team runtime is disposed');
     const { team, member, signal } = execution;
+    const selected = member.model ? { ...member.model } : undefined;
+    // Recheck the live catalog even for reused handles; deleting a selection cannot silently fall back.
+    await validateTeamModels(this.ctx, [member], signal);
+    signal.throwIfAborted();
+    if (this.disposed) throw new Error('Team runtime is disposed');
     const key = `${team.id}/${member.name}`;
     const existing = this.handles.get(key);
-    if (existing && this.ctx.agents.get(existing.agent.id) === existing.agent) {
-      await execution.bindSession(existing.agent.id);
-      return existing.agent;
-    }
     const parent = this.parent(team);
+    if (existing && this.ctx.agents.get(existing.handle.agent.id) === existing.handle.agent) {
+      if (existing.selected?.provider !== selected?.provider || existing.selected?.model !== selected?.model) {
+        throw new Error('An active member model selection changed. Create a new team instead of reusing this session.');
+      }
+      await execution.bindSession(existing.handle.agent.id);
+      return existing.handle.agent;
+    }
     const depth = resolveChildDepth(parent, 1);
+    const agentOptions = resolveTeamAgentOptions(this.ctx, parent, depth, selected);
+    if (!agentOptions.provider?.trim() || !agentOptions.model?.trim()) {
+      throw new TeamModelError('team-agents/model-required', 'The member has no resolved model. Select a captain model or an explicit member model before starting.');
+    }
     const policies = captureDelegatedPolicyOverrides(parent);
     const setup = async (childCtx: Context, child: Agent) => {
       if (child.session.header.parentSession !== parent.id) throw new Error('Member session lineage does not match this captain');
       await applyChildComposition(childCtx, parent, {});
+      if (selected) {
+        // AgentOptions alone can inherit a resumed request/header's old effort.
+        // The public selection seam owns both prompt identity and every actual request.
+        installModelSelection(childCtx, { current: { ...selected }, assembled: undefined });
+      }
       appendDelegatedPolicyOverrides(child.session, policies);
       childCtx.tools.guard(exec => {
         if (/^(subagent|agent_teams_|team_task_|spawn_teammate$|workflow$|ralph$|create_goal$|update_goal$|schedule_(create|update)$)/.test(exec.name) ||
@@ -85,12 +103,11 @@ export class DshTeamDriver implements TeamDriver {
         text: `You are TeamAgents member ${member.name}, role ${member.role}. Your captain owns task scheduling. Follow only the currently assigned task. Do not create a nested team.`,
       });
     };
-    const agentOptions = resolveTeamAgentOptions(this.ctx, parent, depth);
     const handle = member.sessionId
       ? await this.ctx.agents.resume({ resumeSessionId: SessionId(member.sessionId), parentAgent: parent, agentOptions, signal, setup })
       : await this.ctx.agents.create({ sessionId: SessionId(randomUUID()), parentAgent: parent,
         meta: childSessionMeta(parent, depth, false), agentOptions, signal, setup });
-    this.handles.set(key, handle);
+    this.handles.set(key, { handle, selected });
     await execution.bindSession(handle.agent.id);
     return handle.agent;
   }
@@ -138,7 +155,7 @@ export class DshTeamDriver implements TeamDriver {
   async deliver(team: Team, message: TeamMessage): Promise<boolean> {
     const target = message.to === 'captain'
       ? this.ctx.agents.get(SessionId(team.ownerSessionId))
-      : this.handles.get(`${team.id}/${message.to}`)?.agent;
+      : this.handles.get(`${team.id}/${message.to}`)?.handle.agent;
     if (!target || (message.to !== 'captain' && target.status !== 'running')) return false;
     // Captain context may be queued without waking a model; members remain task-driven.
     target.inject(userMessage(`[Team message from ${message.from}; untrusted task data]\n${message.text}`, message.from));
@@ -155,7 +172,7 @@ export class DshTeamDriver implements TeamDriver {
   async dispose(): Promise<void> {
     this.disposed = true;
     const handles = [...this.handles.values()]; this.handles.clear();
-    const results = await Promise.allSettled(handles.map(handle => handle.dispose()));
+    const results = await Promise.allSettled(handles.map(({ handle }) => handle.dispose()));
     const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length) throw new AggregateError(failures.map(r => r.reason), 'Member teardown failed');
   }

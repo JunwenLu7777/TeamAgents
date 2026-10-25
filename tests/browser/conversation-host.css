@@ -1,0 +1,23 @@
+/* Isolated reproduction of the native header/view/composer arrangement, not the logged-in GUI. */
+html, body, #conversation-fixture { height: 100%; margin: 0; }
+body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #262a33; background: #f0f2f6; }
+body[data-theme='dark'] { background: #101318; color: #e3e6ee; color-scheme: dark; }
+#fixture-sidebar { position: fixed; inset: 0 auto 0 0; width: 280px; padding: 28px 18px; box-sizing: border-box; background: #e9ecf3; }
+body[data-theme='dark'] #fixture-sidebar { background: #171b22; }
+#fixture-sidebar small { display: block; margin-top: 12px; opacity: .65; }
+#fixture-conversation { margin-left: 280px; height: 100%; min-width: 0; display: flex; flex-direction: column; background: #fff; }
+body[data-theme='dark'] #fixture-conversation { background: #1c2028; }
+#fixture-header { flex: none; padding: 0 20px; border-bottom: 1px solid #8c96ac30; }
+#fixture-title { height: 40px; display: flex; align-items: center; gap: 14px; font-size: 13px; font-weight: 600; }
+#fixture-title small { font-size: 10px; font-weight: 400; opacity: .6; }
+#fixture-tabs { display: flex; height: 36px; gap: 14px; overflow-x: auto; white-space: nowrap; }
+#fixture-tabs button { flex: none; padding: 0 7px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+#fixture-tabs button[aria-selected='true'] { color: #4d6bfe; border-bottom-color: #4d6bfe; }
+#fixture-scroll { min-height: 0; min-width: 0; flex: 1; overflow-y: auto; }
+#fixture-scroll [data-slot] { display: contents; }
+.fixture-placeholder { margin: 20px; padding: 24px; border: 1px solid #8c96ac30; border-radius: 12px; }
+#fixture-composer { flex: none; padding: 12px 20px; border-top: 1px solid #8c96ac30; }
+#fixture-composer textarea { box-sizing: border-box; display: block; width: 100%; height: 82px; resize: none; border: 1px solid #8c96ac50; border-radius: 12px; padding: 12px; font: inherit; color: inherit; background: transparent; }
+#fixture-composer small { font-size: 11px; opacity: .6; }
+#fixture-dock:empty { display: none; }
+@media (max-width: 700px) { #fixture-sidebar { display: none; } #fixture-conversation { margin-left: 0; } #fixture-title small { display: none; } #fixture-tabs { gap: 8px; } #fixture-header { padding: 0 12px; } #fixture-composer { padding: 10px 12px; } }

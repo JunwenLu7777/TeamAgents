@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context, Service } from '@deepseek-ai/cordis';
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent';
+import type { LlmModelInfo, LlmProviderInfo } from '@deepseek-ai/dsh-llm';
 import { Session, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import Gateway from '@deepseek-ai/dsh-api-gateway';
@@ -9,7 +10,7 @@ import RemoteAccess from '@deepseek-ai/dsh-api-remote-access';
 import { Peer } from '@deepseek-ai/dsh-client-connection';
 import { remoteMethods, remoteErrorOf, type PeerScope } from '@deepseek-ai/dsh-typert-protocol';
 import { TeamEngine, type TeamDriver } from '../src/engine.js';
-import { TeamPlanSchema, TeamSchema, type Team, type TeamPlan } from '../src/model.js';
+import { TeamPlanSchema, TeamSchema, type Team, type TeamPlan, type TeamModelOption } from '../src/model.js';
 import { registerTeamRemote } from '../src/remote.js';
 import { mountTeamRemote, type MountedTeamRemote } from '../src/remote-client.js';
 import { TEAM_REMOTE, TEAM_REMOTE_ENDPOINTS, type TeamRemoteAction } from '../src/remote-contract.js';
@@ -70,8 +71,12 @@ async function fixture() {
   const defaultSelection = vi.fn((): { provider: string; model: string } | undefined => undefined);
   host.provide('agentDefaultModel', { currentSelection: defaultSelection });
   host.provide('sessionProjections', { stateOf: () => undefined });
+  const listProviders = vi.fn((): LlmProviderInfo[] => [{ id: 'configured', name: 'Configured provider' }]);
+  const listModels = vi.fn(async (provider: string): Promise<LlmModelInfo[]> => [{ provider, id: 'selected', name: 'Selected model' }]);
+  const stream = vi.fn(() => { throw new Error('No real model execution allowed'); });
+  host.provide('llm', { listProviders, listModels, stream });
   const remoteFiber = host.plugin({ name: 'test-team-remote',
-    inject: ['typert', 'agents', 'sessions', 'workspaceRegistry', 'sessionController', 'agentDefaultModel', 'sessionProjections'],
+    inject: ['typert', 'agents', 'sessions', 'workspaceRegistry', 'sessionController', 'agentDefaultModel', 'sessionProjections', 'llm'],
     apply(ctx: Context) { registerTeamRemote(ctx, engine); },
   });
   await remoteFiber;
@@ -85,14 +90,14 @@ async function fixture() {
     return agent;
   }
   const captain = actor('captain');
-  function call(method: TeamRemoteAction, request: unknown = { sessionId: 'captain' }, peer: PeerScope = owner, signal?: AbortSignal) {
-    return host.typertGateway.invoke({ namespace: 'teamAgents', method, args: { request }, peer, signal }) as Promise<Team | null>;
+  function call<Action extends TeamRemoteAction>(method: Action, request: unknown = { sessionId: 'captain' }, peer: PeerScope = owner, signal?: AbortSignal) {
+    return host.typertGateway.invoke({ namespace: 'teamAgents', method, args: { request }, peer, signal }) as Promise<Action extends 'models' ? TeamModelOption[] : Team | null>;
   }
   const save = (value = plan(), expectedRevision: number | null = null, sessionId = 'captain') =>
     call('save', { sessionId, expectedRevision, plan: value }) as Promise<Team>;
   cleanups.push(async () => { await engine.dispose(); await host.fiber.dispose(); });
   return { host, rows, actors, runtimeChildren, sessions, persisted, archived, workspace, resolveByPath, workspaceGet, createAgent,
-    inspect, resolveAgent, defaultSelection, engine, driver, captain, actor, owner, guest, call, save, remoteFiber };
+    inspect, resolveAgent, defaultSelection, engine, driver, captain, actor, owner, guest, call, save, remoteFiber, listProviders, listModels, stream };
 }
 
 async function clientFixture(h: Awaited<ReturnType<typeof fixture>>, peer: PeerScope = h.owner) {
@@ -116,7 +121,7 @@ async function clientFixture(h: Awaited<ReturnType<typeof fixture>>, peer: PeerS
     };
     constructor(ctx: Context) { super(ctx, 'connection'); }
   }
-  new Connection(client);
+  const connection = new Connection(client);
   applyClientGateway(client);
   const mount = vi.spyOn(client.remote, '$mount');
   let actions!: MountedTeamRemote;
@@ -125,15 +130,15 @@ async function clientFixture(h: Awaited<ReturnType<typeof fixture>>, peer: PeerS
   });
   await fiber;
   cleanups.push(async () => { await client.fiber.dispose(); });
-  return { client, actions, fiber, calls, mount };
+  return { client, connection, actions, fiber, calls, mount };
 }
 
 describe('current SDK native TeamAgents Remote descriptors', () => {
   it('registers real strict descriptors and session resource markers for every action', async () => {
     const h = await fixture();
-    expect(TEAM_REMOTE.descriptors).toHaveLength(5);
+    expect(TEAM_REMOTE.descriptors).toHaveLength(6);
     const markers = remoteMethods(h.host.get('teamAgents'));
-    expect(markers.map(marker => marker.method).sort()).toEqual(['read', 'retry', 'save', 'start', 'stop']);
+    expect(markers.map(marker => marker.method).sort()).toEqual(['models', 'read', 'retry', 'save', 'start', 'stop']);
     for (const action of Object.keys(TEAM_REMOTE_ENDPOINTS) as TeamRemoteAction[]) {
       const endpoint = TEAM_REMOTE_ENDPOINTS[action];
       const descriptor = h.host.typert.local.get(endpoint)!;
@@ -234,6 +239,95 @@ describe('owner provenance, root isolation, and cancellation', () => {
       expect(h.createAgent).not.toHaveBeenCalled();
       expect(h.driver.run).not.toHaveBeenCalled();
     });
+});
+
+describe('owner-only configured member model catalog and admission', () => {
+  const explicitPlan = () => {
+    const value = plan(); value.members[0]!.model = { provider: 'configured', model: 'selected' }; return value;
+  };
+  it('returns only public model options without materializing an Agent or model call', async () => {
+    const h = await fixture();
+    h.actors.delete('captain'); h.sessions.delete('captain');
+    h.listProviders.mockReturnValue([{ id: 'configured', name: 'Configured provider', apiKey: 'SECRET' } as LlmProviderInfo]);
+    h.listModels.mockResolvedValue([{ provider: 'configured', id: 'selected', name: 'Selected model', description: 'SECRET endpoint details' }]);
+    expect(await h.call('models')).toEqual([{ provider: 'configured', model: 'selected', providerLabel: 'Configured provider', modelLabel: 'Selected model' }]);
+    expect(h.resolveAgent).not.toHaveBeenCalled(); expect(h.createAgent).not.toHaveBeenCalled();
+    expect(h.stream).not.toHaveBeenCalled(); expect(h.defaultSelection).not.toHaveBeenCalled();
+    expect(h.rows.size).toBe(0);
+  });
+  it('authorizes models with the same owner/session boundary, even under a guest policy grant', async () => {
+    const h = await fixture();
+    await expect(h.host.get('teamAgents').models({ sessionId: 'captain' }, new AbortController().signal)).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+    await expect(h.call('models', undefined, h.guest)).rejects.toMatchObject({ code: 'remote-access/denied' });
+    h.host.remoteAccess.registerPolicy('team-transport-test', {
+      bindings: () => [{ role: { name: 'test grant', resource: 'session', actions: [TEAM_REMOTE_ENDPOINTS.models] }, resource: { kind: 'session', id: SessionId('captain') } }],
+    });
+    await expect(h.call('models', undefined, h.guest)).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+    h.actor('child', { origin: 'subagent' });
+    await expect(h.call('models', { sessionId: 'child' })).rejects.toMatchObject({ code: 'team-agents/session-unavailable' });
+    h.archived.push(SessionId('captain'));
+    await expect(h.call('models')).rejects.toThrow('Archived');
+    expect(h.listProviders).not.toHaveBeenCalled(); expect(h.listModels).not.toHaveBeenCalled();
+  });
+  it('refuses unknown selections before saving and deleted selections before activating or starting', async () => {
+    const h = await fixture(); const value = explicitPlan();
+    value.members[0]!.model!.model = 'not-configured';
+    await expect(h.save(value)).rejects.toMatchObject({ code: 'team-agents/model-unavailable' });
+    expect(h.rows.size).toBe(0);
+    const saved = await h.save(explicitPlan());
+    h.listModels.mockResolvedValue([]);
+    await expect(h.save(explicitPlan(), saved.revision)).rejects.toMatchObject({ code: 'team-agents/model-unavailable' });
+    await expect(h.call('start', { sessionId: 'captain', expectedRevision: saved.revision })).rejects.toMatchObject({ code: 'team-agents/model-unavailable' });
+    expect(h.engine.snapshot('captain')).toEqual(saved);
+    expect(h.resolveAgent).not.toHaveBeenCalled(); expect(h.driver.run).not.toHaveBeenCalled(); expect(h.stream).not.toHaveBeenCalled();
+  });
+  it('starts all-explicit teams without a captain model, but mixed inherited work still requires one', async () => {
+    const h = await fixture(); h.actor('captain', {}, {});
+    const saved = await h.save(explicitPlan());
+    await h.call('start', { sessionId: 'captain', expectedRevision: saved.revision });
+    await vi.waitFor(() => expect(h.driver.run).toHaveBeenCalledOnce());
+    expect(h.defaultSelection).not.toHaveBeenCalled();
+    const mixed = explicitPlan(); mixed.members.push({ name: 'reviewer', role: 'Review' });
+    mixed.tasks.push({ id: 'review', subject: 'Review', description: 'Review output', assignee: 'reviewer', dependencies: [], writeScopes: [] });
+    h.actor('mixed', {}, {});
+    const other = await h.save(mixed, null, 'mixed');
+    await expect(h.call('start', { sessionId: 'mixed', expectedRevision: other.revision })).rejects.toMatchObject({ code: 'team-agents/model-required' });
+    expect(h.engine.snapshot('mixed')?.status).toBe('draft');
+    expect(h.driver.run).toHaveBeenCalledOnce();
+  });
+  it('does not return adapter failure secrets via native Remote diagnostics', async () => {
+    const h = await fixture(); h.listModels.mockRejectedValue(new Error('SECRET key or endpoint'));
+    await expect(h.call('models')).rejects.toMatchObject({ code: 'team-agents/model-catalog-unavailable' });
+    await expect(h.call('models')).rejects.not.toThrow('SECRET');
+  });
+  it.each(['replace-agent', 'archive', 'cancel', 'dispose-peer', 'unload'] as const)(
+    'rechecks %s while awaiting the model catalog before saving', async change => {
+      const h = await fixture(); const entered = deferred<void>(); const lookup = deferred<LlmModelInfo[]>();
+      h.listModels.mockImplementation(async () => { entered.resolve(); return lookup.promise; });
+      const abort = new AbortController();
+      const pending = h.call('save', { sessionId: 'captain', expectedRevision: null, plan: explicitPlan() }, h.owner, abort.signal);
+      const rejected = expect(pending).rejects.toThrow();
+      await entered.promise;
+      if (change === 'replace-agent') h.actors.set('captain', { ...h.captain } as Agent);
+      if (change === 'archive') h.archived.push(SessionId('captain'));
+      if (change === 'cancel') abort.abort(new Error('Cancelled while listing'));
+      if (change === 'dispose-peer') await h.owner.dispose();
+      if (change === 'unload') await h.remoteFiber.dispose();
+      lookup.resolve([{ provider: 'configured', id: 'selected', name: 'Selected model' }]);
+      await rejected;
+      expect(h.rows.size).toBe(0); expect(h.driver.run).not.toHaveBeenCalled(); expect(h.createAgent).not.toHaveBeenCalled();
+    });
+  it('retains optimistic revisions across a slow catalog validation', async () => {
+    const h = await fixture(); const initial = await h.save(explicitPlan());
+    const entered = deferred<void>(); const lookup = deferred<LlmModelInfo[]>();
+    h.listModels.mockImplementationOnce(async () => { entered.resolve(); return lookup.promise; });
+    const pending = h.save(explicitPlan(), initial.revision);
+    const rejected = expect(pending).rejects.toThrow('Plan changed');
+    await entered.promise;
+    const updated = await h.engine.savePlan('captain', 'workspace', initial.revision, { ...explicitPlan(), name: 'Newer plan' });
+    lookup.resolve([{ provider: 'configured', id: 'selected', name: 'Selected model' }]);
+    await rejected; expect(h.engine.snapshot('captain')).toEqual(updated);
+  });
 });
 
 describe('native controls and engine CAS without planning-time models', () => {
@@ -404,6 +498,22 @@ describe('real Client Remote mount and session-bound settings actions', () => {
     await expect(a.read()).rejects.toThrow('unloaded');
   });
 
+  it('loads model options through the bound native Remote without weakening team result ownership', async () => {
+    const h = await fixture(); const c = await clientFixture(h); const a = c.actions.forSession('captain');
+    expect(await a.models()).toEqual([{ provider: 'configured', model: 'selected', providerLabel: 'Configured provider', modelLabel: 'Selected model' }]);
+    expect(c.calls[0]).toMatchObject({ endpoint: 'teamAgents/models', args: { request: { sessionId: 'captain' } } });
+    const malformed = vi.spyOn(c.connection.rpc, 'call').mockResolvedValueOnce({ ok: true, value: { models: [] } });
+    await expect(a.models()).rejects.toThrow();
+    h.actor('other'); const other = await h.save(plan(), null, 'other');
+    malformed.mockResolvedValueOnce({ ok: true, value: other });
+    await expect(a.read()).rejects.toThrow('another captain');
+    malformed.mockRestore();
+    const abort = new AbortController(); abort.abort(new Error('Discarded catalog'));
+    const before = c.calls.length;
+    await expect(a.models(abort.signal)).rejects.toThrow('Discarded catalog');
+    expect(c.calls).toHaveLength(before);
+    await c.fiber.dispose(); await expect(a.models()).rejects.toThrow('unloaded');
+  });
   it('preserves native authorization and revision errors rather than fabricating success', async () => {
     const h = await fixture();
     const c = await clientFixture(h);

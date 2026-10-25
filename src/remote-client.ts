@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-gateway/client';
-import { TeamSchema } from './model.js';
+import { TeamModelOptionsSchema, TeamSchema } from './model.js';
 import type { TeamSettingsActions } from './settings-contract.js';
 import {
   TEAM_REMOTE, TEAM_REMOTE_ENDPOINTS, TeamSessionIdSchema,
@@ -31,7 +31,7 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
   return {
     forSession(sessionId) {
       const boundId = TeamSessionIdSchema.parse(sessionId);
-      async function call<Action extends TeamRemoteAction>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      async function invoke<Action extends TeamRemoteAction>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const active = signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal;
         active.throwIfAborted();
         const method = TEAM_REMOTE.methods[TEAM_REMOTE_ENDPOINTS[action]];
@@ -43,11 +43,14 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
         active.throwIfAborted();
         if (!('ok' in result)) throw new Error('Team settings expected a unary Remote result');
         if (!result.ok) throw result.error;
-        const team = TeamSchema.nullable().parse(result.value);
+        return result.value;
+      }
+      async function call<Action extends Exclude<TeamRemoteAction, 'models'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+        const team = TeamSchema.nullable().parse(await invoke(action, request, signal));
         if (team && team.ownerSessionId !== boundId) throw new Error('Team settings received another captain session\'s state');
         return team;
       }
-      async function required<Action extends Exclude<TeamRemoteAction, 'read'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      async function required<Action extends Exclude<TeamRemoteAction, 'read' | 'models'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const team = await call(action, request, signal);
         if (!team) throw new Error('Team settings mutation returned no saved team');
         return team;
@@ -56,6 +59,7 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
       // an in-flight save, start, stop, or retry. Only the Host authorizes it.
       return Object.freeze({
         read: (signal?: AbortSignal) => call('read', { sessionId: boundId }, signal),
+        models: async (signal?: AbortSignal) => TeamModelOptionsSchema.parse(await invoke('models', { sessionId: boundId }, signal)),
         save: (plan, expectedRevision, signal) => required('save', { sessionId: boundId, plan, expectedRevision }, signal),
         start: (expectedRevision, signal) => required('start', { sessionId: boundId, expectedRevision }, signal),
         stop: (signal?: AbortSignal) => required('stop', { sessionId: boundId }, signal),

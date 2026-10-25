@@ -11,5 +11,5 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["src/index.ts", "tests/engine.test.ts", "tests/model.test.ts", "tests/runtime.test.ts", "tests/projection.test.ts", "tests/host.test.ts", "tests/draft-plan.test.ts", "tests/model-route.test.ts", "tests/remote.test.ts"]
+  "include": ["src/index.ts", "tests/*.test.ts"]
 }

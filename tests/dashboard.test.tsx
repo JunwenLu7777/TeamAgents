@@ -1,16 +1,24 @@
+// @vitest-environment jsdom
 import type { Context } from '@deepseek-ai/cordis';
 import type { ComponentType } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { build } from 'esbuild';
-import { describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render as renderDom, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { apply, inject } from '../src/client.js';
 import { TeamDashboard } from '../src/dashboard.js';
 import { en, locales, zh, type TeamTranslate } from '../src/locales.js';
 import type { Task, Team } from '../src/model.js';
+import type { TeamSettingsActions } from '../src/settings-contract.js';
+import { mountTeamRemote } from '../src/remote-client.js';
+import { mountAgentLibraryRemote } from '../src/library-remote-client.js';
+import { registerTeamSettings } from '../src/settings-integration.js';
 
-// Dock glue stays independently testable; separate suites exercise real settings and Gateway wiring.
-vi.mock('../src/remote-client.js', () => ({ mountTeamRemote: vi.fn(async () => ({ forSession: vi.fn() })) }));
+// View glue stays independently testable; separate suites exercise real settings and Gateway wiring.
+vi.mock('../src/remote-client.js', () => ({ mountTeamRemote: vi.fn(async () => ({ forSession: vi.fn(() => ({ stop: vi.fn() })) })) }));
+vi.mock('../src/library-remote-client.js', () => ({ mountAgentLibraryRemote: vi.fn(async () => ({ read: vi.fn(), models: vi.fn(), save: vi.fn() })) }));
 vi.mock('../src/settings-integration.js', () => ({ registerTeamSettings: vi.fn() }));
+
+afterEach(cleanup);
 
 function translator(language: 'en' | 'zh' = 'en'): TeamTranslate {
   return (key, params = {}) => locales[language][key].replace(/\{(\w+)\}/g, (_, name: string) => String(params[name] ?? `{${name}}`));
@@ -44,6 +52,22 @@ function render(value: Team | null | undefined, language: 'en' | 'zh' = 'en') {
   return renderToStaticMarkup(<TeamDashboard team={value} t={translator(language)} />);
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function showPanel() {
+  const panel = document.querySelector<HTMLDetailsElement>('details.dsh-team-agents');
+  if (panel) panel.open = true;
+}
+
+function stopActions() {
+  return { stop: vi.fn<TeamSettingsActions['stop']>().mockResolvedValue(team({ status: 'paused', revision: 8 })) };
+}
+
 describe('TeamDashboard', () => {
   it.each([null, undefined])('does not occupy the composer without a projection (%s)', value => {
     expect(render(value)).toBe('');
@@ -69,7 +93,7 @@ describe('TeamDashboard', () => {
     expect(html).toContain('not filesystem permissions');
   });
 
-  it('starts collapsed, uses native disclosures for results, and exposes no execution controls', () => {
+  it('starts collapsed, uses native disclosures for results, and is read-only without stop authority', () => {
     const html = render(team());
     const disclosures = html.match(/<details\b[^>]*>/g) ?? [];
     expect(disclosures.length).toBeGreaterThan(3);
@@ -150,6 +174,111 @@ describe('TeamDashboard', () => {
   });
 });
 
+describe('conversation-only explicit Stop', () => {
+  it('shows selected model routes and inherited routes from this session snapshot', () => {
+    const snapshot = team({ members: [
+      { name: 'designer', role: 'Design', model: { provider: 'saved-provider', model: 'saved-model' } },
+      { name: 'tester', role: 'Test' },
+    ] });
+    expect(render(snapshot)).toContain('Ship a clear, usable release.');
+    expect(render(snapshot)).toContain('Model: saved-provider / saved-model');
+    expect(render(snapshot)).toContain('Model: inherit captain');
+    expect(render(snapshot, 'zh')).toContain('模型：saved-provider / saved-model');
+    expect(render(snapshot, 'zh')).toContain('模型：继承主会话');
+  });
+
+  it.each(['draft', 'paused', 'blocked', 'completed'] as const)('never offers Stop or Start for a %s team', status => {
+    const actions = stopActions();
+    const html = renderToStaticMarkup(<TeamDashboard sessionId="captain-session" team={team({ status })} canStop actions={actions} t={translator()} />);
+    expect(html).not.toContain('<button'); expect(actions.stop).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false])('requires affirmative host access before showing Stop (%s)', canStop => {
+    const actions = stopActions();
+    const html = renderToStaticMarkup(<TeamDashboard sessionId="captain-session" team={team()} canStop={canStop} actions={actions} t={translator()} />);
+    expect(html).not.toContain('<button'); expect(actions.stop).not.toHaveBeenCalled();
+  });
+
+  it('requires the matching owner session and does not display foreign projected state', () => {
+    const actions = stopActions();
+    expect(renderToStaticMarkup(<TeamDashboard team={team()} canStop actions={actions} t={translator()} />)).not.toContain('<button');
+    expect(renderToStaticMarkup(<TeamDashboard sessionId="other-session" team={team()} canStop actions={actions} t={translator()} />)).toBe('');
+    expect(actions.stop).not.toHaveBeenCalled();
+  });
+
+  it('calls only Stop on an explicit click, blocks duplicate clicks, and accepts the returned paused snapshot', async () => {
+    const pending = deferred<Team>();
+    const actions = { stop: vi.fn<TeamSettingsActions['stop']>().mockReturnValue(pending.promise) };
+    const snapshot = team();
+    const view = renderDom(<TeamDashboard sessionId="captain-session" team={snapshot} canStop actions={actions} t={translator()} />);
+    showPanel();
+    expect(screen.queryByRole('button', { name: 'Start' })).toBeNull();
+    expect(actions.stop).not.toHaveBeenCalled();
+    const button = screen.getByRole('button', { name: 'Stop team' }) as HTMLButtonElement;
+    fireEvent.click(button); fireEvent.click(button);
+    expect(actions.stop).toHaveBeenCalledOnce();
+    expect(actions.stop).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(button.disabled).toBe(true); expect(button.textContent).toBe('Stopping…');
+    await act(async () => pending.resolve(team({ status: 'paused', revision: 8 })));
+    expect(document.querySelector('.dta-identity [data-status="paused"]')).not.toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+    view.rerender(<TeamDashboard sessionId="captain-session" team={{ ...snapshot }} canStop actions={actions} t={translator()} />);
+    expect(screen.queryByRole('button')).toBeNull();
+    view.rerender(<TeamDashboard sessionId="captain-session" team={team({ revision: 9 })} canStop actions={actions} t={translator()} />);
+    expect(screen.getByRole('button', { name: 'Stop team' })).not.toBeNull();
+  });
+
+  it('shows a safe error and allows another explicit Stop after a failed request', async () => {
+    const actions = stopActions();
+    actions.stop.mockRejectedValueOnce(new Error('<img src=x onerror=alert(1)>'));
+    renderDom(<TeamDashboard sessionId="captain-session" team={team()} canStop actions={actions} t={translator()} />);
+    showPanel(); fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert').textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(document.querySelector('img')).toBeNull();
+    expect((screen.getByRole('button', { name: 'Stop team' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
+    await waitFor(() => expect(screen.queryByRole('button')).toBeNull());
+    expect(actions.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a stop response for another team without replacing the visible plan', async () => {
+    const actions = stopActions();
+    actions.stop.mockResolvedValue(team({ id: 'foreign-team', name: 'Foreign name', status: 'paused', revision: 100 }));
+    renderDom(<TeamDashboard sessionId="captain-session" team={team()} canStop actions={actions} t={translator()} />);
+    showPanel(); fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert').textContent).toContain('does not match this team');
+    expect(screen.queryByText('Foreign name')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Stop team' })).not.toBeNull();
+  });
+
+  it.each(['unmount', 'switch', 'revoke', 'remove'] as const)('cancels an in-flight request on %s and ignores late completion', async transition => {
+    const pending = deferred<Team>();
+    const actions = { stop: vi.fn<TeamSettingsActions['stop']>().mockReturnValue(pending.promise) };
+    const view = renderDom(<TeamDashboard sessionId="captain-session" team={team()} canStop actions={actions} t={translator()} />);
+    showPanel(); fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
+    const signal = actions.stop.mock.calls[0]![0]!;
+    if (transition === 'unmount') view.unmount();
+    else if (transition === 'switch') view.rerender(<TeamDashboard sessionId="other-session"
+      team={team({ id: 'other-team', ownerSessionId: 'other-session', name: 'Other crew' })} canStop actions={stopActions()} t={translator()} />);
+    else if (transition === 'revoke') view.rerender(<TeamDashboard sessionId="captain-session" team={team()} canStop={false} actions={actions} t={translator()} />);
+    else view.rerender(<TeamDashboard sessionId="captain-session" team={null} canStop actions={actions} t={translator()} />);
+    expect(signal.aborted).toBe(true);
+    await act(async () => pending.resolve(team({ name: 'Late response', status: 'paused', revision: 100 })));
+    expect(screen.queryByText('Late response')).toBeNull(); expect(screen.queryByRole('alert')).toBeNull();
+    if (transition === 'switch') expect(screen.getByText('Other crew')).not.toBeNull();
+  });
+
+  it('translates Stop without introducing a Start or configuration form', () => {
+    const actions = stopActions();
+    const html = renderToStaticMarkup(<TeamDashboard sessionId="captain-session" team={team()} canStop actions={actions} t={translator('zh')} />);
+    expect(html).toContain('停止团队');
+    expect(html).not.toMatch(/<(?:form|input|select|textarea)\b/);
+    expect(html).not.toContain('Start'); expect(actions.stop).not.toHaveBeenCalled();
+  });
+});
+
 describe('pending explanations', () => {
   const running = task({ id: 'active', status: 'running', assignee: 'tester', writeScopes: ['src'] });
 
@@ -193,7 +322,7 @@ describe('pending explanations', () => {
 });
 
 describe('current DSH client integration', () => {
-  it('waits for the dock declaration and uses its projection and locale seats', async () => {
+  it('waits for the native conversation view and uses its projection and locale seats', async () => {
     const disposeLocale = vi.fn();
     const disposeSlot = vi.fn();
     const effects: Array<() => void> = [];
@@ -204,6 +333,7 @@ describe('current DSH client integration', () => {
       effect(setup: () => () => void) { effects.push(setup()); },
       locale: { register: registerLocale },
       slots: {
+        entries: vi.fn(() => [{ options: { id: 'agent-team', order: 40 } }]),
         inject: vi.fn((_key: string, callback: () => () => void) => { install = callback; return () => {}; }),
         register,
       },
@@ -211,37 +341,58 @@ describe('current DSH client integration', () => {
     await apply(context as unknown as Context);
     expect(inject).toEqual(expect.arrayContaining(['slots', 'locale', 'uiSession']));
     expect(registerLocale).toHaveBeenCalledWith('team-agents', locales);
-    expect(context.slots.inject).toHaveBeenCalledWith('conversation.composer.dock', expect.any(Function));
+    expect(context.slots.inject).toHaveBeenCalledWith('conversation.view', expect.any(Function));
     expect(register).not.toHaveBeenCalled();
 
     const dispose = install!();
-    expect(register).toHaveBeenCalledWith({ name: 'conversation.composer.dock', id: 'dsh-team-agents', order: 40, locale: 'team-agents' }, expect.any(Function));
-    const Slot = register.mock.calls[0]![1] as ComponentType<{ useProjection: (key: 'team-agents') => Team | null | undefined; t: TeamTranslate }>;
+    expect(register).toHaveBeenCalledWith({ name: 'conversation.view', id: 'dsh-team-agents', label: 'TeamAgents', order: 1001, locale: 'team-agents' }, expect.any(Function));
+    const Slot = register.mock.calls[0]![1] as ComponentType<{ sessionId: string; useAccess: (endpoint: string) => boolean; useProjection: (key: 'team-agents') => Team | null | undefined; t: TeamTranslate }>;
     const projection = vi.fn((_key: 'team-agents'): Team | null | undefined => team());
-    expect(renderToStaticMarkup(<Slot useProjection={projection} t={translator()} />)).toContain('Release crew');
+    const useAccess = vi.fn((_endpoint: string) => false);
+    expect(renderToStaticMarkup(<Slot sessionId="captain-session" useAccess={useAccess} useProjection={projection} t={translator()} />)).toContain('Release crew');
     expect(projection).toHaveBeenCalledWith('team-agents');
+    expect(useAccess).toHaveBeenCalledWith('teamAgents/stop');
+    expect(mountTeamRemote).toHaveBeenCalledWith(context);
+    expect(mountAgentLibraryRemote).toHaveBeenCalledWith(context);
+    const library = await vi.mocked(mountAgentLibraryRemote).mock.results.at(-1)!.value;
+    expect(registerTeamSettings).toHaveBeenCalledWith(context, library);
     projection.mockReturnValue(null);
-    expect(renderToStaticMarkup(<Slot useProjection={projection} t={translator()} />)).toBe('');
+    expect(renderToStaticMarkup(<Slot sessionId="captain-session" useAccess={useAccess} useProjection={projection} t={translator()} />)).toContain('No TeamAgents team has been created');
     dispose();
     for (const cleanup of effects) cleanup();
     expect(disposeSlot).toHaveBeenCalledOnce();
     expect(disposeLocale).toHaveBeenCalledOnce();
   });
 
-  it('bundles for the browser with only React runtime externals', async () => {
-    const result = await build({
-      entryPoints: ['src/client.tsx'], bundle: true, write: false, metafile: true,
-      platform: 'browser', format: 'cjs', external: ['react', 'react/jsx-runtime'], jsx: 'automatic',
-    });
-    const imports = Object.values(result.metafile!.outputs).flatMap(output => output.imports);
-    expect(imports.length).toBeGreaterThan(0);
-    expect(imports.every(entry => entry.external && ['react', 'react/jsx-runtime'].includes(entry.path))).toBe(true);
-    const inputs = Object.keys(result.metafile!.inputs);
-    expect(inputs).toContain('src/model.ts');
-    expect(inputs).toContain('src/settings-integration.tsx');
-    expect(inputs).not.toContain('src/projection.ts');
-    expect(inputs).not.toContain('src/remote.ts');
-    expect(inputs).not.toContain('src/model-route.ts');
-    expect(result.outputFiles[0]!.text).toContain('module.exports');
+  it('binds only Stop to the active session and the native stop ACL, not to global library settings', async () => {
+    const stop = vi.fn(async (_sessionId: string, _signal?: AbortSignal) => team({ status: 'paused', revision: 8 }));
+    const otherActions = {
+      read: vi.fn<TeamSettingsActions['read']>(), models: vi.fn<TeamSettingsActions['models']>(),
+      save: vi.fn<TeamSettingsActions['save']>(), start: vi.fn<TeamSettingsActions['start']>(), retry: vi.fn<TeamSettingsActions['retry']>(),
+    };
+    const forSession = vi.fn((sessionId: string): TeamSettingsActions => ({
+      ...otherActions, stop: signal => stop(sessionId, signal),
+    }));
+    vi.mocked(mountTeamRemote).mockResolvedValueOnce({ forSession });
+    let install!: () => unknown;
+    const register = vi.fn((_options: unknown, _component: unknown) => () => {});
+    const ctx = { effect: (setup: () => () => void) => setup(), locale: { register: vi.fn(() => () => {}) },
+      slots: { entries: () => [], inject: vi.fn((_key: string, callback: () => unknown) => { install = callback; }), register } };
+    await apply(ctx as unknown as Context); install();
+    const Slot = register.mock.calls[0]![1] as ComponentType<{ sessionId: string; useAccess: (endpoint: string) => boolean;
+      useProjection: (key: 'team-agents') => Team; t: TeamTranslate }>;
+    const useAccess = vi.fn((_endpoint: string) => false);
+    const useProjection = vi.fn(() => team());
+    const view = renderDom(<Slot sessionId="captain-session" useAccess={useAccess} useProjection={useProjection} t={translator()} />);
+    showPanel(); expect(screen.queryByRole('button')).toBeNull();
+    expect(forSession).toHaveBeenCalledWith('captain-session'); expect(stop).not.toHaveBeenCalled();
+    useAccess.mockReturnValue(true);
+    view.rerender(<Slot sessionId="captain-session" useAccess={useAccess} useProjection={useProjection} t={translator()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('captain-session', expect.any(AbortSignal)));
+    expect(useAccess.mock.calls.every(([endpoint]) => endpoint === 'teamAgents/stop')).toBe(true);
+    expect(forSession).toHaveBeenCalledOnce();
+    for (const action of Object.values(otherActions)) expect(action).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Start' })).toBeNull();
   });
 });

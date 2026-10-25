@@ -1,425 +1,267 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { planOf, scopesOverlap, TeamPlanSchema, type Task, type Team, type TeamPlan } from './model.js';
-import type { TeamSettingsActions, TeamSettingsData } from './settings-contract.js';
+import { AgentLibrarySchema, MAX_LIBRARY_AGENTS, type AgentDefinition, type AgentLibrary } from './library-model.js';
+import type { TeamModelOption } from './model.js';
+import { createRoleMember, ROLE_TEMPLATES } from './role-templates.js';
+import type { AgentLibraryActions, TeamSettingsData } from './settings-contract.js';
 import type { SettingsKey, SettingsTranslate } from './settings-locales.js';
 
-export interface TeamSettingsPageProps extends TeamSettingsData {
-  actions: TeamSettingsActions;
-  t: SettingsTranslate;
-}
-
-type DraftMember = { name: string; role: string; instructions: string };
-type DraftTask = Omit<TeamPlan['tasks'][number], 'dependencies' | 'writeScopes'> & { dependencies: string; writeScopes: string };
-type Draft = { name: string; goal: string; maxConcurrency: string; members: DraftMember[]; tasks: DraftTask[] };
-type Operation = 'read' | 'save' | 'start' | 'stop' | 'retry';
+export interface TeamSettingsPageProps extends TeamSettingsData { actions: AgentLibraryActions; t: SettingsTranslate; }
+type DraftAgent = Omit<AgentDefinition, 'instructions'> & { instructions: string };
+type Operation = 'read' | 'save';
 type Notice = { key: SettingsKey; params?: Record<string, string | number> };
 type EditorState = {
-  base: Team | null | undefined;
-  latest: Team | null | undefined;
-  draft: Draft;
-  dirty: boolean;
-  conflict: boolean;
-  approved: string | null;
-  submitted: boolean;
-  error: string | null;
-  notice: Notice | null;
+  base: AgentLibrary | undefined; latest: AgentLibrary | undefined; draft: DraftAgent[];
+  dirty: boolean; conflict: boolean; submitted: boolean; error: string | null; notice: Notice | null;
 };
+const modelValue = (route: { provider: string; model: string }) => JSON.stringify([route.provider, route.model]);
 
+// Settings owns scrolling. This normal-flow section owns its own border-box reset,
+// including the root, rather than changing host CSS or introducing an inner viewport.
 const styles = `
-.dsh-team-settings { --dts-border: color-mix(in srgb, currentColor 18%, transparent); --dts-fill: color-mix(in srgb, currentColor 4%, transparent); color: inherit; font: inherit; line-height: 1.5; width: 100%; max-width: 72rem; min-width: 0; margin-inline: auto; padding: clamp(12px, 3vw, 28px); }
-.dsh-team-settings *, .dsh-team-settings *::before, .dsh-team-settings *::after { box-sizing: border-box; }
+.dsh-team-settings { --dts-accent: #4d6bfe; --dts-border: color-mix(in srgb, currentColor 12%, transparent); --dts-fill: color-mix(in srgb, currentColor 3%, transparent); --dts-muted: color-mix(in srgb, currentColor 68%, transparent); color: inherit; font: inherit; line-height: 1.6; width: 100%; max-width: 68rem; min-width: 0; margin-inline: auto; padding: 4px 4px 24px; overflow-wrap: anywhere; container: team-settings / inline-size; }
+.dsh-team-settings, .dsh-team-settings::before, .dsh-team-settings::after, .dsh-team-settings *, .dsh-team-settings *::before, .dsh-team-settings *::after { box-sizing: border-box; }
 .dsh-team-settings h2, .dsh-team-settings h3, .dsh-team-settings h4, .dsh-team-settings p { margin: 0; }
-.dsh-team-settings h2 { font-size: 1.35rem; font-weight: 650; }
-.dsh-team-settings h3 { font-size: 1rem; font-weight: 650; }
-.dsh-team-settings h4 { font-size: .9rem; font-weight: 600; }
-.dsh-team-settings .dts-heading, .dsh-team-settings .dts-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
-.dsh-team-settings .dts-heading { justify-content: space-between; margin-bottom: 12px; }
-.dsh-team-settings .dts-stack { display: grid; gap: 14px; min-width: 0; }
+.dsh-team-settings h2 { font-size: 1.35rem; font-weight: 700; letter-spacing: -.025em; line-height: 1.3; }
+.dsh-team-settings h3 { font-size: .95rem; font-weight: 650; }
+.dsh-team-settings h4 { font-size: .875rem; font-weight: 650; }
+.dsh-team-settings .dts-heading, .dsh-team-settings .dts-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; min-width: 0; }
+.dsh-team-settings .dts-heading { justify-content: space-between; }
+.dsh-team-settings .dts-heading > *, .dsh-team-settings .dts-actions > * { min-width: 0; max-width: 100%; }
+.dsh-team-settings.dts-stack, .dsh-team-settings .dts-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; align-content: start; }
+.dsh-team-settings .dts-hero { padding: 18px; border: 1px solid color-mix(in srgb, var(--dts-accent) 22%, transparent); border-radius: 14px; background: linear-gradient(125deg, color-mix(in srgb, var(--dts-accent) 9%, transparent), transparent 85%); }
+.dsh-team-settings .dts-eyebrow { color: var(--dts-muted); font-size: .65rem; font-weight: 650; letter-spacing: .1em; margin-bottom: 6px; }
+.dsh-team-settings .dts-hero .dts-hint { margin-top: 8px; max-width: 34rem; }
+.dsh-team-settings .dts-stats { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dts-border); }
 .dsh-team-settings .dts-card { border: 1px solid var(--dts-border); border-radius: 12px; padding: 16px; min-width: 0; background: transparent; }
-.dsh-team-settings .dts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr)); gap: 12px; min-width: 0; }
-.dsh-team-settings .dts-field { display: grid; align-content: start; gap: 5px; min-width: 0; font-size: .875rem; }
-.dsh-team-settings .dts-hint { font-size: .8rem; opacity: .75; overflow-wrap: anywhere; }
-.dsh-team-settings input:not([type='checkbox']), .dsh-team-settings textarea, .dsh-team-settings select { display: block; width: 100%; min-width: 0; border: 1px solid var(--dts-border); border-radius: 7px; padding: 8px 10px; background: var(--dts-fill); color: inherit; font: inherit; line-height: 1.5; }
-.dsh-team-settings textarea { resize: vertical; }
-.dsh-team-settings option { background: Canvas; color: CanvasText; }
-.dsh-team-settings input[readonly], .dsh-team-settings textarea[readonly], .dsh-team-settings select:disabled { opacity: .8; }
-.dsh-team-settings [aria-invalid='true'] { border-style: dashed; border-width: 2px; }
+.dsh-team-settings .dts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: 12px; min-width: 0; }
+.dsh-team-settings .dts-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 12px; min-width: 0; }
+.dsh-team-settings .dts-field { display: grid; align-content: start; gap: 6px; min-width: 0; font-size: .8rem; font-weight: 500; }
+.dsh-team-settings .dts-hint { font-size: .75rem; font-weight: 400; color: var(--dts-muted); overflow-wrap: anywhere; }
+.dsh-team-settings input:not([type='checkbox']), .dsh-team-settings textarea, .dsh-team-settings select { display: block; width: 100%; max-width: 100%; min-width: 0; margin: 0; border: 1px solid var(--dts-border); border-radius: 8px; padding: 9px 11px; background: var(--dts-fill); color: inherit; font: inherit; font-weight: 400; line-height: 1.5; }
+.dsh-team-settings textarea { resize: vertical; min-height: 80px; }
+.dsh-team-settings select { text-overflow: ellipsis; }
+.dsh-team-settings option, .dsh-team-settings optgroup { background: Canvas; color: CanvasText; }
+.dsh-team-settings input[readonly], .dsh-team-settings textarea[readonly], .dsh-team-settings select:disabled { opacity: .7; }
+.dsh-team-settings [aria-invalid='true'] { border-color: #e05454; }
 .dsh-team-settings fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
-.dsh-team-settings fieldset > legend { font-size: 1rem; font-weight: 650; padding: 0; margin-bottom: 12px; }
-.dsh-team-settings button { font: inherit; font-size: .85rem; color: inherit; background: var(--dts-fill); border: 1px solid var(--dts-border); border-radius: 7px; min-height: 36px; padding: 7px 12px; cursor: pointer; }
+.dsh-team-settings .dts-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.dsh-team-settings button { font: inherit; font-size: .78rem; font-weight: 500; color: inherit; background: var(--dts-fill); border: 1px solid var(--dts-border); border-radius: 8px; min-height: 34px; max-width: 100%; padding: 7px 11px; cursor: pointer; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.dsh-team-settings button:hover:not(:disabled) { background: color-mix(in srgb, var(--dts-accent) 8%, transparent); border-color: color-mix(in srgb, var(--dts-accent) 45%, transparent); }
 .dsh-team-settings button:disabled { cursor: not-allowed; opacity: .45; }
-.dsh-team-settings .dts-primary { border-color: currentColor; font-weight: 600; }
-.dsh-team-settings :is(button, input, textarea, select, summary):focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
-.dsh-team-settings .dts-banner { border: 1px solid var(--dts-border); border-inline-start: 3px solid currentColor; border-radius: 8px; padding: 12px; overflow-wrap: anywhere; }
+.dsh-team-settings .dts-primary { background: #3e58e8; border-color: #3e58e8; color: #fff; font-weight: 600; padding-inline: 20px; }
+.dsh-team-settings .dts-primary:hover:not(:disabled) { background: #3047c8; border-color: #3047c8; }
+.dsh-team-settings .dts-remove { background: transparent; color: var(--dts-muted); font-size: .7rem; padding: 4px 8px; min-height: 28px; }
+.dsh-team-settings :is(button, input, textarea, select, summary):focus-visible { outline: 2px solid var(--dts-accent); outline-offset: 2px; }
+.dsh-team-settings .dts-banner { border: 1px solid var(--dts-border); border-inline-start: 3px solid var(--dts-accent); border-radius: 8px; padding: 12px; font-size: .8rem; overflow-wrap: anywhere; }
+.dsh-team-settings .dts-banner[role='alert'] { border-inline-start-color: #e49a35; }
 .dsh-team-settings .dts-banner ul { margin: 6px 0 0; padding-inline-start: 22px; }
-.dsh-team-settings .dts-badge { display: inline-block; font-size: .75rem; border: 1px solid var(--dts-border); border-radius: 999px; padding: 2px 8px; }
-.dsh-team-settings .dts-confirm { display: flex; align-items: flex-start; gap: 9px; font-size: .875rem; }
-.dsh-team-settings .dts-confirm input { flex: 0 0 auto; margin-top: .3em; accent-color: currentColor; }
-.dsh-team-settings .dts-runs { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
-.dsh-team-settings .dts-run { border-top: 1px solid var(--dts-border); padding-top: 12px; min-width: 0; }
-.dsh-team-settings code { font-size: .8rem; overflow-wrap: anywhere; }
-.dsh-team-settings details { margin-top: 8px; }
-.dsh-team-settings summary { cursor: pointer; }
-.dsh-team-settings pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14rem; overflow: auto; font: inherit; font-size: .8rem; }
-@media (max-width: 480px) { .dsh-team-settings .dts-card { padding: 12px; } .dsh-team-settings .dts-actions > button { flex: 1 1 auto; } }
+.dsh-team-settings .dts-badge { display: inline-block; font-size: .7rem; font-weight: 500; background: var(--dts-fill); border: 1px solid var(--dts-border); border-radius: 6px; padding: 3px 8px; }
+.dsh-team-settings .dts-template-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.dsh-team-settings .dts-template { text-align: start; display: grid; gap: 4px; padding: 12px; background: transparent; }
+.dsh-team-settings .dts-template strong { font-size: .8rem; font-weight: 600; }
+.dsh-team-settings .dts-template .dts-hint { font-size: .7rem; line-height: 1.5; }
+.dsh-team-settings .dts-agent { border-inline-start: 3px solid color-mix(in srgb, var(--dts-accent) 45%, transparent); }
+.dsh-team-settings .dts-agent[data-enabled='false'] { border-inline-start-color: var(--dts-border); }
+.dsh-team-settings .dts-avatar { display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 28px; font-size: .7rem; font-weight: 600; color: var(--dts-accent); background: color-mix(in srgb, var(--dts-accent) 8%, transparent); border-radius: 50%; }
+.dsh-team-settings .dts-agent-title { flex: 1; min-width: 0; }
+.dsh-team-settings .dts-agent-title h4 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-team-settings .dts-enabled { display: flex; align-items: center; gap: 8px; font-size: .78rem; }
+.dsh-team-settings .dts-enabled input { flex: 0 0 auto; width: 17px; height: 17px; margin: 0; accent-color: var(--dts-accent); }
+.dsh-team-settings .dts-empty { text-align: center; border: 1px dashed var(--dts-border); border-radius: 10px; padding: 22px 14px; }
+.dsh-team-settings .dts-savebar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 4px 0; }
+.dsh-team-settings .dts-savebar .dts-hint { flex: 1 1 180px; }
+.dsh-team-settings code { display: block; padding: 12px; border-radius: 8px; background: var(--dts-fill); font: inherit; font-size: .8rem; overflow-wrap: anywhere; }
+.dsh-team-settings details { min-width: 0; }
+.dsh-team-settings summary { cursor: pointer; font-size: .78rem; font-weight: 500; padding: 6px 2px; }
+.dsh-team-settings details > .dts-stack { margin-top: 10px; }
+@container team-settings (max-width: 380px) { .dsh-team-settings .dts-template-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dsh-team-settings .dts-card, .dsh-team-settings .dts-hero { padding: 14px; } }
+@media (prefers-reduced-motion: no-preference) { .dsh-team-settings button { transition: background-color .15s, border-color .15s; } }
 `;
 
-function emptyDraft(): Draft {
-  return { name: '', goal: '', maxConcurrency: '3', members: [], tasks: [] };
+function draftOf(library: AgentLibrary | undefined): DraftAgent[] {
+  return (library?.agents ?? []).map(agent => ({ ...structuredClone(agent), instructions: agent.instructions ?? '' }));
 }
-
-function draftOf(team: Team | null | undefined): Draft {
-  if (!team) return emptyDraft();
-  const plan = planOf(team);
-  return {
-    ...plan,
-    maxConcurrency: String(plan.maxConcurrency),
-    members: plan.members.map(member => ({ ...member, instructions: member.instructions ?? '' })),
-    tasks: plan.tasks.map(task => ({ ...task, dependencies: task.dependencies.join(', '), writeScopes: task.writeScopes.join('\n') })),
-  };
+function initialState(library: AgentLibrary | undefined): EditorState {
+  return { base: library, latest: library, draft: draftOf(library), dirty: false, conflict: false, submitted: false, error: null, notice: null };
 }
-
-function initialState(team: Team | null | undefined): EditorState {
-  return { base: team, latest: team, draft: draftOf(team), dirty: false, conflict: false, approved: null, submitted: false, error: null, notice: null };
+function reconcile(state: EditorState, library: AgentLibrary): EditorState {
+  if (state.latest && library.revision <= state.latest.revision) return state;
+  return state.dirty || state.conflict ? { ...state, latest: library, conflict: true, notice: null } : initialState(library);
 }
-
-function snapshotKey(team: Team | null | undefined): string {
-  return team ? `${team.id}:${team.revision}` : team === null ? 'empty' : 'unresolved';
-}
-
-function olderThan(candidate: Team | null | undefined, current: Team | null | undefined): boolean {
-  return !!candidate && !!current && candidate.id === current.id && candidate.revision < current.revision;
-}
-
-function configurationEditable(team: Team | null | undefined): boolean {
-  return team === null || (!!team && team.status !== 'running' && team.tasks.every(task => task.attempt === 0) && team.members.every(member => !member.sessionId));
-}
-
-function reconcileSnapshot(state: EditorState, incoming: Team | null): EditorState {
-  if (olderThan(incoming, state.latest) || snapshotKey(incoming) === snapshotKey(state.latest)) return state;
-  if (state.dirty || state.conflict) {
-    return { ...state, latest: incoming, conflict: true, approved: null, notice: null };
-  }
-  return initialState(incoming);
-}
-
-function exampleDraft(t: SettingsTranslate): Draft {
-  const instructions = t('example.instructions');
-  return {
-    name: t('example.name'), goal: t('example.goal'), maxConcurrency: '3',
-    members: [
-      { name: 'observer', role: t('example.observerRole'), instructions },
-      { name: 'reviewer', role: t('example.reviewerRole'), instructions },
-      { name: 'summarizer', role: t('example.writerRole'), instructions },
-    ],
-    tasks: [
-      { id: 'inspect', subject: t('example.inspectTitle'), description: t('example.inspectDescription'), assignee: 'observer', dependencies: '', writeScopes: '' },
-      { id: 'review', subject: t('example.reviewTitle'), description: t('example.reviewDescription'), assignee: 'reviewer', dependencies: '', writeScopes: '' },
-      { id: 'summarize', subject: t('example.summaryTitle'), description: t('example.summaryDescription'), assignee: 'summarizer', dependencies: 'inspect, review', writeScopes: '' },
-    ],
-  };
-}
-
 type FormError = { path: string; message: string };
-function validateDraft(draft: Draft, t: SettingsTranslate): { plan?: TeamPlan; errors: FormError[] } {
-  const parsed = TeamPlanSchema.safeParse({
-    ...draft,
-    maxConcurrency: draft.maxConcurrency.trim() ? Number(draft.maxConcurrency) : Number.NaN,
-    members: draft.members.map(({ name, role, instructions }) => ({ name, role, ...(instructions.trim() ? { instructions } : {}) })),
-    tasks: draft.tasks.map(task => ({
-      ...task,
-      dependencies: task.dependencies.split(/[,\n]/).map(value => value.trim()).filter(Boolean),
-      writeScopes: task.writeScopes.split('\n').map(value => value.trim()).filter(Boolean),
-    })),
-  });
+function validateDraft(draft: DraftAgent[], t: SettingsTranslate): { agents?: AgentDefinition[]; errors: FormError[] } {
+  const parsed = AgentLibrarySchema.safeParse({ revision: 0, updatedAt: null,
+    agents: draft.map(({ instructions, ...agent }) => ({ ...agent, ...(instructions.trim() ? { instructions } : {}) })) });
   const errors: FormError[] = [];
-  const fieldKeys: Record<string, SettingsKey> = {
-    name: 'validation.name', goal: 'validation.goal', maxConcurrency: 'validation.concurrency',
-    members: 'validation.members', tasks: 'validation.tasks', role: 'validation.role', instructions: 'validation.instructions',
-    id: 'validation.taskId', subject: 'validation.title', description: 'validation.description', assignee: 'validation.assignee',
-    dependencies: 'validation.dependencies', writeScopes: 'validation.scopes',
-  };
+  const add = (path: string, message: string) => { if (!errors.some(error => error.path === path && error.message === message)) errors.push({ path, message }); };
+  const fieldKeys: Record<string, SettingsKey> = { name: 'validation.name', role: 'validation.role', instructions: 'validation.instructions', model: 'validation.model' };
   if (!parsed.success) for (const issue of parsed.error.issues) {
-    const path = issue.path.join('.');
-    const field = String(issue.path[2] ?? issue.path[0] ?? '');
-    let message: string;
-    if (!path) {
-      if (issue.message === 'Duplicate member name') message = t('validation.duplicateMember');
-      else if (issue.message === 'Duplicate task id') message = t('validation.duplicateTask');
-      else if (issue.message.startsWith('Task dependency cycle at ')) message = t('validation.cycle', { id: issue.message.slice('Task dependency cycle at '.length) });
-      else if (issue.message.startsWith('Unknown dependency: ')) message = t('validation.missingDependency', { id: issue.message.slice('Unknown dependency: '.length) });
-      else if (issue.message.startsWith('Unknown member: ')) message = t('validation.missingMember', { name: issue.message.slice('Unknown member: '.length) });
-      else message = t('validation.graph');
-    } else {
-      const key = issue.path[0] === 'members' && field === 'name' ? 'validation.memberName' : fieldKeys[field] ?? 'validation.graph';
-      const prefix = issue.path[0] === 'members' && typeof issue.path[1] === 'number'
-        ? `${t('member.heading', { number: issue.path[1] + 1 })}: `
-        : issue.path[0] === 'tasks' && typeof issue.path[1] === 'number'
-          ? `${t('task.heading', { number: issue.path[1] + 1 })}: ` : '';
-      message = prefix + t(key);
-    }
-    if (!errors.some(error => error.path === path && error.message === message)) errors.push({ path, message });
+    const field = String(issue.path[2] ?? '');
+    const key = fieldKeys[field] ?? 'validation.library';
+    const prefix = typeof issue.path[1] === 'number' ? `${t('agent.heading', { number: issue.path[1] + 1 })}: ` : '';
+    add(issue.path.join('.'), prefix + t(key));
   }
-  // The public model accepts legacy names containing consecutive hyphens; new
-  // settings edits use the lower-kebab-case convention shown by this form.
-  draft.members.forEach((member, index) => {
-    const path = `members.${index}.name`;
-    if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(member.name) && !errors.some(error => error.path === path)) {
-      errors.push({ path, message: `${t('member.heading', { number: index + 1 })}: ${t('validation.memberName')}` });
-    }
+  const names = new Set<string>();
+  draft.forEach((agent, index) => {
+    const path = `agents.${index}.name`;
+    if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(agent.name)) add(path, t('validation.name'));
+    if (names.has(agent.name)) add(path, t('validation.duplicate'));
+    names.add(agent.name);
   });
-  return { ...(parsed.success && !errors.length ? { plan: parsed.data } : {}), errors };
+  return { ...(parsed.success && !errors.length ? { agents: parsed.data.agents } : {}), errors };
 }
 
-function dependencyReady(team: Team, task: Task): boolean {
-  return task.status === 'pending' && task.dependencies.every(id => team.tasks.some(other => other.id === id && other.status === 'completed'));
-}
-
-function taskReady(team: Team, task: Task): boolean {
-  if (!dependencyReady(team, task)) return false;
-  const running = team.tasks.filter(other => other.status === 'running');
-  return running.length < team.maxConcurrency
-    && !running.some(other => other.assignee === task.assignee || scopesOverlap(other.writeScopes, task.writeScopes));
-}
-
-function pendingReason(team: Team, task: Task, t: SettingsTranslate): string {
-  const missing = task.dependencies.filter(id => !team.tasks.some(other => other.id === id && other.status === 'completed'));
-  if (missing.length) return t('pending.dependencies', { ids: missing.join(', ') });
-  const running = team.tasks.filter(other => other.status === 'running');
-  if (running.some(other => other.assignee === task.assignee)) return t('pending.member');
-  if (running.some(other => scopesOverlap(other.writeScopes, task.writeScopes))) return t('pending.scope');
-  if (running.length >= team.maxConcurrency) return t('pending.capacity');
-  return t(team.status === 'running' ? 'pending.ready' : 'pending.approval');
-}
-
-/** No SDK context or routing: the parent supplies session-scoped, authorized actions. */
+/** No Session provider or session id: this is reusable host configuration, not a run plan. */
 export function TeamSettingsPage(props: TeamSettingsPageProps) {
-  // Also defend against non-keyed consumers: old requests and drafts cannot move
-  // between conversations, even if an action ignores its AbortSignal.
-  return <TeamSettingsEditor key={props.sessionId ?? '__no_session__'} {...props} />;
+  return <AgentLibraryEditor key={props.canRead === false ? 'unavailable' : 'readable'} {...props} />;
 }
-
-function TeamSettingsEditor({ sessionId, team, loading = false, unavailableReason, canManage, actions, t }: TeamSettingsPageProps) {
-  const [state, setState] = useState(() => initialState(team));
+function AgentLibraryEditor({ library, loading = false, canRead = true, canManage = false, unavailableReason,
+  actions, t, modelOptions, modelsLoading = false, modelsError, onRefreshModels }: TeamSettingsPageProps) {
+  const [state, setState] = useState(() => initialState(canRead ? library : undefined));
   const [busy, setBusy] = useState<Operation | null>(null);
   const mounted = useRef(false);
-  const activeRequest = useRef<AbortController | null>(null);
+  const active = useRef<AbortController | null>(null);
   const formId = useId();
   const validation = useMemo(() => validateDraft(state.draft, t), [state.draft, t]);
-
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-      activeRequest.current?.abort();
-      activeRequest.current = null;
-    };
-  }, []);
-  useEffect(() => {
-    if (team !== undefined) setState(previous => reconcileSnapshot(previous, team));
-  }, [team]);
-
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; active.current?.abort(); active.current = null; }; }, []);
+  useEffect(() => { if (canRead && library) setState(previous => reconcile(previous, library)); }, [library, canRead]);
   const waiting = loading || state.latest === undefined;
-  const authorized = !!sessionId && canManage === true && !unavailableReason;
-  const writable = configurationEditable(state.latest);
-  const canEdit = authorized && !waiting && !busy && writable;
-  const canSave = canEdit && state.dirty && !state.conflict;
-  const saved = state.latest;
-  const ready = saved?.tasks.filter(task => taskReady(saved, task)).length ?? 0;
-  const canStart = authorized && !waiting && !busy && !!saved && saved.status !== 'running'
-    && !state.dirty && !state.conflict && ready > 0 && !!validation.plan;
-  const canRetry = authorized && !waiting && !busy && !!saved && saved.status !== 'running' && !state.dirty && !state.conflict;
-  const canStop = authorized && !waiting && !busy && saved?.status === 'running';
-  const canRead = !!sessionId && !unavailableReason && !busy;
-  const approvalKey = saved ? snapshotKey(saved) : null;
-  const approved = approvalKey !== null && state.approved === approvalKey;
-
-  function changeDraft(change: (previous: Draft) => Draft) {
-    if (!canEdit || activeRequest.current) return;
+  const canEdit = canRead && canManage && !waiting && !busy && !unavailableReason;
+  const explicit = state.draft.filter(agent => agent.enabled && agent.model);
+  const modelsValid = !explicit.length || (!modelsLoading && !modelsError && modelOptions !== undefined
+    && explicit.every(agent => modelOptions.some(option => modelValue(option) === modelValue(agent.model!))));
+  const canSave = canEdit && state.dirty && !state.conflict && modelsValid;
+  const groups = new Map<string, TeamModelOption[]>();
+  for (const option of modelOptions ?? []) {
+    const group = groups.get(option.provider);
+    if (group) group.push(option); else groups.set(option.provider, [option]);
+  }
+  function change(update: (draft: DraftAgent[]) => DraftAgent[]) {
+    if (!canEdit || active.current) return;
     setState(previous => {
-      const draft = change(previous.draft);
-      return { ...previous, draft, dirty: JSON.stringify(draft) !== JSON.stringify(draftOf(previous.base)), approved: null, error: null, notice: null };
+      const draft = update(previous.draft);
+      return { ...previous, draft, dirty: JSON.stringify(draft) !== JSON.stringify(draftOf(previous.base)), error: null, notice: null };
     });
   }
-
-  function updateMember(index: number, field: keyof DraftMember, value: string) {
-    changeDraft(previous => {
-      const oldName = previous.members[index]?.name;
-      return {
-        ...previous,
-        members: previous.members.map((member, position) => position === index ? { ...member, [field]: value } : member),
-        tasks: field === 'name' && oldName && previous.members.filter(member => member.name === oldName).length === 1
-          ? previous.tasks.map(task => task.assignee === oldName ? { ...task, assignee: value } : task) : previous.tasks,
-      };
-    });
+  function patch(index: number, values: Partial<DraftAgent>) {
+    change(draft => draft.map((agent, position) => position === index ? { ...agent, ...values } : agent));
   }
-
-  function updateTask(index: number, field: keyof DraftTask, value: string) {
-    changeDraft(previous => {
-      const oldId = previous.tasks[index]?.id;
-      const rename = field === 'id' && oldId && previous.tasks.filter(task => task.id === oldId).length === 1;
-      return {
-        ...previous,
-        tasks: previous.tasks.map((task, position) => {
-          let updated = position === index ? { ...task, [field]: value } : task;
-          if (rename) updated = { ...updated, dependencies: updated.dependencies.split(/([,\n])/).map(part => part.trim() === oldId ? part.replace(oldId, value) : part).join('') };
-          return updated;
-        }),
-      };
-    });
+  function chooseModel(index: number, value: string) {
+    const option = (modelOptions ?? []).find(candidate => modelValue(candidate) === value);
+    if (value && !option) return;
+    change(draft => draft.map((agent, position) => {
+      if (position !== index) return agent;
+      const { model: _model, ...rest } = agent;
+      return option ? { ...rest, model: { provider: option.provider, model: option.model } } : rest;
+    }));
   }
-
-  async function perform(operation: Operation, request: (signal: AbortSignal) => Promise<Team | null>) {
-    if (!mounted.current || activeRequest.current) return;
-    const controller = new AbortController();
-    const startedKey = snapshotKey(state.latest);
-    activeRequest.current = controller;
-    setBusy(operation);
-    setState(previous => ({ ...previous, error: null, notice: null, approved: null }));
+  function addRole(id: string) {
+    if (state.draft.length >= MAX_LIBRARY_AGENTS) return;
+    change(draft => [...draft, { ...createRoleMember(id, draft.map(agent => agent.name), t), enabled: true }]);
+  }
+  async function perform(operation: Operation, request: (signal: AbortSignal) => Promise<AgentLibrary>) {
+    if (!mounted.current || active.current) return;
+    const controller = new AbortController(); active.current = controller;
+    const baseRevision = state.base?.revision;
+    setBusy(operation); setState(previous => ({ ...previous, error: null, notice: null }));
     try {
-      const result = await request(controller.signal);
-      if (!mounted.current || controller.signal.aborted || activeRequest.current !== controller) return;
-      if (result && result.ownerSessionId !== sessionId) throw new Error(t('error.session'));
-      if (operation !== 'read' && !result) throw new Error(t('error.unknown'));
+      const result = AgentLibrarySchema.parse(await request(controller.signal));
+      if (!mounted.current || controller.signal.aborted || active.current !== controller) return;
+      if (operation === 'save' && (baseRevision === undefined || result.revision <= baseRevision)) throw new Error(t('error.response'));
       setState(previous => {
-        const advanced = snapshotKey(previous.latest) !== startedKey;
-        const obsolete = olderThan(result, previous.latest)
-          || (advanced && result?.id !== previous.latest?.id);
-        if (operation === 'read') {
-          const current = obsolete ? previous.latest : result;
-          return { ...initialState(current), notice: { key: 'reload.success' } };
-        }
-        if (obsolete) return { ...previous, approved: null, conflict: previous.dirty || previous.conflict };
-        if (operation === 'save') return { ...initialState(result), notice: { key: 'save.success', params: { revision: result!.revision } } };
-        const noticeKeys = { start: 'execution.started', stop: 'execution.stopped', retry: 'execution.prepared' } as const;
-        return { ...reconcileSnapshot(previous, result!), approved: null, notice: { key: noticeKeys[operation] } };
+        const obsolete = previous.latest && result.revision < previous.latest.revision;
+        if (operation === 'save' && obsolete) return { ...previous, conflict: true };
+        return { ...initialState(obsolete ? previous.latest : result), notice: operation === 'save'
+          ? { key: 'save.success', params: { revision: result.revision } } : { key: 'reload.success' } };
       });
     } catch (error) {
-      if (mounted.current && !controller.signal.aborted && activeRequest.current === controller) {
-        setState(previous => ({ ...previous, approved: null, error: error instanceof Error ? error.message : t('error.unknown') }));
+      if (mounted.current && !controller.signal.aborted && active.current === controller) {
+        setState(previous => ({ ...previous, error: error instanceof Error ? error.message : t('error.unknown') }));
       }
     } finally {
-      if (mounted.current && activeRequest.current === controller) {
-        activeRequest.current = null;
-        setBusy(null);
-      }
+      if (mounted.current && active.current === controller) { active.current = null; setBusy(null); }
     }
   }
-
-  function savePlan() {
-    if (!canSave || activeRequest.current) return;
+  function save() {
+    if (!canSave || !state.base || active.current) return;
     setState(previous => ({ ...previous, submitted: true }));
-    if (!validation.plan) return;
-    void perform('save', signal => actions.save(validation.plan!, state.base?.revision ?? null, signal));
+    if (validation.agents) void perform('save', signal => actions.save(validation.agents!, state.base!.revision, signal));
   }
-
   function fieldAccessibility(path: string) {
     const invalid = state.submitted && validation.errors.some(error => error.path === path || error.path.startsWith(`${path}.`));
     return { 'aria-invalid': invalid || undefined, 'aria-describedby': invalid ? `${formId}-errors` : undefined };
   }
 
-  return <section className="dsh-team-settings dts-stack" aria-label={t('page.title')} aria-busy={!!busy || waiting}>
+  return <section className="dsh-team-settings dts-stack" aria-label={t('page.title')} aria-busy={canRead && (!!busy || waiting)}>
     <style>{styles}</style>
-    <header className="dts-stack">
-      <div className="dts-heading">
-        <h2>{t('page.title')}</h2>
-        <div className="dts-actions">
-          <span className="dts-badge">{state.dirty ? t('team.unsaved') : saved ? t('team.revision', { revision: saved.revision }) : t('team.notSaved')}</span>
-          {saved && <span className="dts-badge" data-status={saved.status}>{t(`status.${saved.status}`)}</span>}
-          <button type="button" disabled={!canRead} onClick={() => { if (canRead) void perform('read', signal => actions.read(signal)); }}>{t(state.dirty || state.conflict ? 'reload.discard' : 'reload.button')}</button>
-        </div>
-      </div>
+    <header className="dts-hero">
+      <div className="dts-heading"><div><p className="dts-eyebrow">{t('page.eyebrow')}</p><h2>{t('page.title')}</h2></div>
+        {canRead && state.latest && <span className="dts-badge">{t(state.dirty ? 'library.unsaved' : 'library.saved')}</span>}</div>
       <p className="dts-hint">{t('page.description')}</p>
-    </header>
-
-    {!sessionId && <p className="dts-banner" role="status">{t('session.missing')}</p>}
-    {waiting && <p className="dts-banner" role="status">{t('session.loading')}</p>}
-    {unavailableReason && <p className="dts-banner" role="alert">{unavailableReason}</p>}
-    {sessionId && canManage !== true && <p className="dts-banner" role="status">{t('session.readonly')}</p>}
-    {saved && !writable && <p className="dts-banner">{t('team.locked')}</p>}
-    {state.conflict && <p className="dts-banner" role="alert">{t('team.conflict')}</p>}
-    {state.error && <p className="dts-banner" role="alert">{t('error.action', { message: state.error })}</p>}
-    {busy && <p role="status">{t(`busy.${busy}`)}</p>}
-    {state.notice && <p className="dts-banner" role="status">{t(state.notice.key, state.notice.params)}</p>}
-
-    <form className="dts-stack" noValidate onSubmit={event => { event.preventDefault(); savePlan(); }}>
-      {state.submitted && validation.errors.length > 0 && <div className="dts-banner" role="alert" id={`${formId}-errors`}>
-        <p>{t('validation.heading')}</p>
-        <ul>{validation.errors.map((error, index) => <li key={`${error.path}:${index}`}>{error.message}</li>)}</ul>
+      {canRead && <div className="dts-heading dts-stats">
+        <div className="dts-actions"><span className="dts-badge">{t('page.count', { count: state.draft.length })}</span><span className="dts-badge">{t('page.enabled', { count: state.draft.filter(agent => agent.enabled).length })}</span>
+          {state.latest && <span className="dts-hint">{t('library.revision', { revision: state.latest.revision })}</span>}</div>
+        <div className="dts-actions"><button type="button" disabled={!!busy} onClick={() => { void perform('read', signal => actions.read(signal)); }}>{t(state.dirty || state.conflict ? 'reload.discard' : 'reload.button')}</button>
+          {onRefreshModels && <button type="button" disabled={modelsLoading || !!busy} onClick={onRefreshModels}>{t('models.refresh')}</button>}</div>
       </div>}
-      <fieldset disabled={!canEdit}>
-        <legend>{t('team.configuration')}</legend>
-        <div className="dts-stack">
-          <div className="dts-card dts-stack">
-            <label className="dts-field">{t('team.name')}<input value={state.draft.name} maxLength={100} readOnly={!canEdit} {...fieldAccessibility('name')} onChange={event => changeDraft(previous => ({ ...previous, name: event.target.value }))} /></label>
-            <label className="dts-field">{t('team.goal')}<textarea value={state.draft.goal} rows={3} maxLength={20_000} readOnly={!canEdit} {...fieldAccessibility('goal')} onChange={event => changeDraft(previous => ({ ...previous, goal: event.target.value }))} /></label>
-            <label className="dts-field">{t('team.concurrency')}<input type="number" min={1} max={8} step={1} value={state.draft.maxConcurrency} readOnly={!canEdit} {...fieldAccessibility('maxConcurrency')} onChange={event => changeDraft(previous => ({ ...previous, maxConcurrency: event.target.value }))} /></label>
-            <p className="dts-hint">{t('team.concurrencyHint')}</p>
-          </div>
-
-          {state.base === null && !state.dirty && <div className="dts-card dts-stack">
-            <p className="dts-hint">{t('example.hint')}</p>
-            <div><button type="button" onClick={() => changeDraft(() => exampleDraft(t))}>{t('example.load')}</button></div>
-          </div>}
-
-          <section className="dts-stack" aria-label={t('members.heading')}>
-            <div className="dts-heading"><h3>{t('members.heading')} · {state.draft.members.length}/12</h3><button type="button" disabled={!canEdit || state.draft.members.length >= 12} onClick={() => changeDraft(previous => ({ ...previous, members: [...previous.members, { name: '', role: '', instructions: '' }] }))}>{t('member.add')}</button></div>
-            <p className="dts-hint">{t('member.nameHint')}</p>
-            {!state.draft.members.length && <p className="dts-hint">{t('members.empty')}</p>}
-            <div className="dts-grid">{state.draft.members.map((member, index) => <article className="dts-card dts-stack" key={index}>
-              <div className="dts-heading"><h4>{t('member.heading', { number: index + 1 })}</h4><button type="button" aria-label={t('member.remove', { number: index + 1 })} onClick={() => changeDraft(previous => ({ ...previous, members: previous.members.filter((_, position) => position !== index) }))}>{t('member.remove', { number: index + 1 })}</button></div>
-              <label className="dts-field">{t('member.name')}<input value={member.name} maxLength={40} readOnly={!canEdit} aria-label={t('member.field', { number: index + 1, field: t('member.name') })} {...fieldAccessibility(`members.${index}.name`)} onChange={event => updateMember(index, 'name', event.target.value)} /></label>
-              <label className="dts-field">{t('member.role')}<input value={member.role} maxLength={20_000} readOnly={!canEdit} aria-label={t('member.field', { number: index + 1, field: t('member.role') })} {...fieldAccessibility(`members.${index}.role`)} onChange={event => updateMember(index, 'role', event.target.value)} /></label>
-              <label className="dts-field">{t('member.instructions')}<textarea value={member.instructions} rows={3} maxLength={20_000} readOnly={!canEdit} aria-label={t('member.field', { number: index + 1, field: t('member.instructions') })} {...fieldAccessibility(`members.${index}.instructions`)} onChange={event => updateMember(index, 'instructions', event.target.value)} /></label>
-              <p className="dts-hint">{t('team.model')}</p>
-            </article>)}</div>
-          </section>
-
-          <section className="dts-stack" aria-label={t('tasks.heading')}>
-            <div className="dts-heading"><h3>{t('tasks.heading')} · {state.draft.tasks.length}/200</h3><button type="button" disabled={!canEdit || state.draft.tasks.length >= 200} onClick={() => changeDraft(previous => ({ ...previous, tasks: [...previous.tasks, { id: '', subject: '', description: '', assignee: previous.members[0]?.name ?? '', dependencies: '', writeScopes: '' }] }))}>{t('task.add')}</button></div>
-            <p className="dts-hint">{t('team.referenceHint')}</p>
-            {!state.draft.tasks.length && <p className="dts-hint">{t('tasks.empty')}</p>}
-            <div className="dts-grid">{state.draft.tasks.map((task, index) => <article className="dts-card dts-stack" key={index}>
-              <div className="dts-heading"><h4>{t('task.heading', { number: index + 1 })}</h4><button type="button" aria-label={t('task.remove', { number: index + 1 })} onClick={() => changeDraft(previous => ({ ...previous, tasks: previous.tasks.filter((_, position) => position !== index) }))}>{t('task.remove', { number: index + 1 })}</button></div>
-              <label className="dts-field">{t('task.id')}<input value={task.id} maxLength={80} readOnly={!canEdit} aria-label={t('task.field', { number: index + 1, field: t('task.id') })} {...fieldAccessibility(`tasks.${index}.id`)} onChange={event => updateTask(index, 'id', event.target.value)} /></label>
-              <label className="dts-field">{t('task.title')}<input value={task.subject} maxLength={200} readOnly={!canEdit} aria-label={t('task.field', { number: index + 1, field: t('task.title') })} {...fieldAccessibility(`tasks.${index}.subject`)} onChange={event => updateTask(index, 'subject', event.target.value)} /></label>
-              <label className="dts-field">{t('task.description')}<textarea value={task.description} rows={3} maxLength={20_000} readOnly={!canEdit} aria-label={t('task.field', { number: index + 1, field: t('task.description') })} {...fieldAccessibility(`tasks.${index}.description`)} onChange={event => updateTask(index, 'description', event.target.value)} /></label>
-              <label className="dts-field">{t('task.assignee')}<select value={task.assignee} aria-label={t('task.field', { number: index + 1, field: t('task.assignee') })} {...fieldAccessibility(`tasks.${index}.assignee`)} onChange={event => updateTask(index, 'assignee', event.target.value)}>
-                <option value="">{t('task.chooseMember')}</option>
-                {task.assignee && !state.draft.members.some(member => member.name === task.assignee) && <option value={task.assignee}>{t('task.missingMember', { name: task.assignee })}</option>}
-                {state.draft.members.map((member, memberIndex) => member.name && <option key={memberIndex} value={member.name}>{member.name}</option>)}
+    </header>
+    {!canRead && <p className="dts-banner" role="status">{t('library.readonly')}</p>}
+    {canRead && <>
+      {waiting && !unavailableReason && <p className="dts-hint" role="status">{t('library.loading')}</p>}
+      {unavailableReason && <p className="dts-banner" role="alert">{unavailableReason}</p>}
+      {!canManage && <p className="dts-banner" role="status">{t('library.readonly')}</p>}
+      {state.conflict && <p className="dts-banner" role="alert">{t('library.conflict')}</p>}
+      {state.error && <p className="dts-banner" role="alert">{t('error.action', { message: state.error })}</p>}
+      {busy && <p role="status">{t(`busy.${busy}`)}</p>}
+      {state.notice && <p className="dts-banner" role="status">{t(state.notice.key, state.notice.params)}</p>}
+      <form className="dts-stack" noValidate onSubmit={event => { event.preventDefault(); save(); }}>
+        {state.submitted && validation.errors.length > 0 && <div className="dts-banner" role="alert" id={`${formId}-errors`}><p>{t('validation.heading')}</p>
+          <ul>{validation.errors.map((error, index) => <li key={`${error.path}:${index}`}>{error.message}</li>)}</ul></div>}
+        <fieldset disabled={!canEdit}><legend className="dts-sr-only">{t('library.heading')}</legend><div className="dts-stack">
+          <details className="dts-card dts-library" open><summary>{t('roles.heading')}</summary><div className="dts-stack">
+            <p className="dts-hint">{t('roles.hint')}</p>
+            <div className="dts-template-grid">{ROLE_TEMPLATES.map(template => <button key={template.id} type="button" className="dts-template"
+              disabled={!canEdit || state.draft.length >= MAX_LIBRARY_AGENTS} aria-label={t('roles.add', { role: t(template.titleKey) })} onClick={() => addRole(template.id)}>
+              <strong>{t(template.titleKey)}</strong><span className="dts-hint">{t(template.descriptionKey)}</span>
+            </button>)}</div>
+          </div></details>
+          <div className="dts-heading"><div><h3>{t('library.heading')}</h3><p className="dts-hint">{t('library.limit', { count: MAX_LIBRARY_AGENTS })}</p></div>
+            <button type="button" disabled={!canEdit || state.draft.length >= MAX_LIBRARY_AGENTS} onClick={() => change(draft => [...draft, { name: '', role: '', instructions: '', enabled: true }])}>{t('agent.add')}</button></div>
+          <p className="dts-hint">{t('models.hint')}</p>
+          {modelsLoading && <p className="dts-hint" role="status">{t('models.loading')}</p>}
+          {modelsError && <p className="dts-banner" role="alert">{t('models.error', { message: modelsError })}</p>}
+          {!modelsLoading && !modelsError && modelOptions?.length === 0 && <p className="dts-hint">{t('models.empty')}</p>}
+          {!modelsValid && !modelsLoading && !modelsError && <p className="dts-banner" role="alert">{t('models.invalid')}</p>}
+          {!state.draft.length && <p className="dts-empty dts-hint">{t('library.empty')}</p>}
+          <div className="dts-grid">{state.draft.map((agent, index) => <article className="dts-card dts-stack dts-agent" key={index} data-enabled={agent.enabled}>
+            <div className="dts-heading"><span className="dts-avatar" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+              <div className="dts-agent-title"><h4 title={agent.role}>{agent.role || t('agent.custom')}</h4><p className="dts-hint">{t('agent.heading', { number: index + 1 })}</p></div>
+              <button type="button" className="dts-remove" onClick={() => change(draft => draft.filter((_, position) => position !== index))}>{t('agent.remove', { number: index + 1 })}</button></div>
+            <label className="dts-enabled"><input type="checkbox" role="switch" checked={agent.enabled} disabled={!canEdit}
+              aria-label={t('agent.field', { number: index + 1, field: t('agent.enabled') })} onChange={event => patch(index, { enabled: event.target.checked })} />{t(agent.enabled ? 'agent.enabled' : 'agent.disabled')}</label>
+            <div className="dts-fields">
+              <label className="dts-field">{t('agent.name')}<input value={agent.name} maxLength={40} readOnly={!canEdit} aria-label={t('agent.field', { number: index + 1, field: t('agent.name') })} {...fieldAccessibility(`agents.${index}.name`)} onChange={event => patch(index, { name: event.target.value })} /></label>
+              <label className="dts-field">{t('agent.model')}<select value={agent.model ? modelValue(agent.model) : ''} disabled={!canEdit || modelsLoading}
+                aria-label={t('agent.field', { number: index + 1, field: t('agent.model') })}
+                aria-invalid={agent.enabled && agent.model && modelOptions !== undefined && !modelOptions.some(option => modelValue(option) === modelValue(agent.model!)) || undefined}
+                onChange={event => chooseModel(index, event.target.value)}>
+                <option value="">{t('models.inherit')}</option>
+                {agent.model && !modelOptions?.some(option => modelValue(option) === modelValue(agent.model!)) && <option value={modelValue(agent.model)} disabled>{t('models.unavailable', agent.model)}</option>}
+                {[...groups].map(([provider, options]) => <optgroup key={provider} label={options[0]!.providerLabel}>{options.map(option => <option key={modelValue(option)} value={modelValue(option)}>{option.modelLabel}</option>)}</optgroup>)}
               </select></label>
-              <label className="dts-field">{t('task.dependencies')}<textarea value={task.dependencies} rows={2} aria-label={t('task.field', { number: index + 1, field: t('task.dependencies') })} readOnly={!canEdit} {...fieldAccessibility(`tasks.${index}.dependencies`)} onChange={event => updateTask(index, 'dependencies', event.target.value)} /></label>
-              <p className="dts-hint">{t('task.dependenciesHint')}</p>
-              <label className="dts-field">{t('task.writeScopes')}<textarea value={task.writeScopes} rows={2} aria-label={t('task.field', { number: index + 1, field: t('task.writeScopes') })} readOnly={!canEdit} {...fieldAccessibility(`tasks.${index}.writeScopes`)} onChange={event => updateTask(index, 'writeScopes', event.target.value)} /></label>
-              <p className="dts-hint">{t('task.scopesHint')}</p>
-            </article>)}</div>
-          </section>
-        </div>
-      </fieldset>
-      <div className="dts-actions"><button type="submit" className="dts-primary" disabled={!canSave}>{t('save.button')}</button></div>
-    </form>
-
-    <section className="dts-card dts-stack" aria-label={t('execution.heading')}>
-      <div className="dts-heading"><h3>{t('execution.heading')}</h3>{saved && <span className="dts-hint">{t('team.revision', { revision: saved.revision })}</span>}</div>
-      <p className="dts-hint">{t('execution.cost')}</p>
-      {saved && <p className="dts-hint">{t('execution.counts', { pending: saved.tasks.filter(task => task.status === 'pending').length, ready, failed: saved.tasks.filter(task => task.status === 'failed').length })}</p>}
-      {state.dirty && <p className="dts-hint">{t('execution.saveFirst')}</p>}
-      {!ready && saved?.status !== 'running' && <p className="dts-hint">{t('execution.noPending')}</p>}
-      {saved && <label className="dts-confirm"><input type="checkbox" checked={approved} disabled={!canStart} onChange={event => { if (canStart) setState(previous => ({ ...previous, approved: event.target.checked ? approvalKey : null })); }} />{t('execution.confirm', { revision: saved.revision })}</label>}
-      <div className="dts-actions">
-        <button type="button" className="dts-primary" disabled={!canStart || !approved} onClick={() => { if (canStart && approved && saved) void perform('start', signal => actions.start(saved.revision, signal)); }}>{t('execution.start')}</button>
-        <button type="button" disabled={!canStop} onClick={() => { if (canStop) void perform('stop', signal => actions.stop(signal)); }}>{t('execution.stop')}</button>
-      </div>
-      {!!saved?.tasks.some(task => task.status === 'failed') && <p className="dts-hint">{t('execution.retryHint')}</p>}
-      {saved && <ul className="dts-runs">{saved.tasks.map(task => <li className="dts-run" key={task.id}>
-        <div className="dts-heading"><div className="dts-actions"><code>{task.id}</code><span>{task.subject}</span><span className="dts-badge" data-status={task.status}>{t(`status.${task.status}`)}</span><span className="dts-hint">{t('task.attempt', { attempt: task.attempt })}</span></div>
-          {task.status === 'failed' && <button type="button" disabled={!canRetry} onClick={() => { if (canRetry) void perform('retry', signal => actions.retry(task.id, saved.revision, signal)); }}>{t('execution.retry', { id: task.id })}</button>}
-        </div>
-        {task.status === 'pending' && <p className="dts-hint">{pendingReason(saved, task, t)}</p>}
-        {task.status === 'failed' && <details><summary>{t('task.error')}</summary><pre>{task.error || t('task.noError')}</pre></details>}
-        {task.output && <details><summary>{t('task.output')}</summary><pre>{task.output}</pre></details>}
-      </li>)}</ul>}
-    </section>
+            </div>
+            <p className="dts-hint">{agent.model ? `${modelOptions?.find(option => modelValue(option) === modelValue(agent.model!))?.providerLabel ?? agent.model.provider} / ${agent.model.model}` : t('agent.inherited')}</p>
+            <details><summary>{t('agent.details')}</summary><div className="dts-stack">
+              <p className="dts-hint">{t('agent.nameHint')}</p>
+              <label className="dts-field">{t('agent.role')}<input value={agent.role} maxLength={20_000} readOnly={!canEdit} aria-label={t('agent.field', { number: index + 1, field: t('agent.role') })} {...fieldAccessibility(`agents.${index}.role`)} onChange={event => patch(index, { role: event.target.value })} /></label>
+              <label className="dts-field">{t('agent.instructions')}<textarea value={agent.instructions} rows={5} maxLength={20_000} readOnly={!canEdit} aria-label={t('agent.field', { number: index + 1, field: t('agent.instructions') })} {...fieldAccessibility(`agents.${index}.instructions`)} onChange={event => patch(index, { instructions: event.target.value })} /></label>
+            </div></details>
+          </article>)}</div>
+          <p className="dts-hint">{t('library.snapshotHint')}</p>
+        </div></fieldset>
+        <div className="dts-savebar"><p className="dts-hint">{t('save.hint')}</p><button type="submit" className="dts-primary" disabled={!canSave}>{t('save.button')}</button></div>
+      </form>
+    </>}
+    <section className="dts-card dts-stack" aria-label={t('usage.heading')}><h3>{t('usage.heading')}</h3><code>{t('usage.example')}</code><p className="dts-hint">{t('usage.hint')}</p></section>
   </section>;
 }
