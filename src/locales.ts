@@ -62,6 +62,21 @@ export const en = {
   'message.sentAt': 'Sent at {time}',
   'message.delivered': 'Delivered',
   'message.queued': 'Queued',
+  'export.heading': 'Export run record',
+  'export.hint': 'Downloads this session’s currently retained team snapshot. It is not a complete attempt history or a token-by-token conversation log.',
+  'export.privacy': 'Task descriptions, outputs, errors and team messages may contain sensitive information. Review the file before sharing it.',
+  'export.format': 'File format',
+  'export.formatMarkdown': 'Markdown',
+  'export.formatJson': 'JSON',
+  'export.includeMessages': 'Include retained team messages',
+  'export.includeMessagesHint': 'Team mailbox text will be written into the file.',
+  'export.messagesWarning': 'Messages are included. The file will contain the retained team mailbox text, which may be sensitive.',
+  'export.download': 'Download export',
+  'export.downloading': 'Preparing download…',
+  'export.error': 'Could not create the export: {message}',
+  'export.unknownError': 'Unknown error',
+  'export.mismatch': 'The export response does not match this team.',
+  'export.done': 'Download ready: {filename}',
 } as const;
 
 export type TeamAgentsKey = keyof typeof en;
@@ -129,6 +144,21 @@ export const zh = {
   'message.sentAt': '发送时间：{time}',
   'message.delivered': '已送达',
   'message.queued': '待送达',
+  'export.heading': '导出运行记录',
+  'export.hint': '下载当前会话已保留的团队快照。它不是完整的历史尝试记录，也不是逐 token 的对话日志。',
+  'export.privacy': '任务描述、输出、错误以及团队消息可能包含敏感信息，分享前请先检查文件内容。',
+  'export.format': '文件格式',
+  'export.formatMarkdown': 'Markdown',
+  'export.formatJson': 'JSON',
+  'export.includeMessages': '包含已保留的团队消息',
+  'export.includeMessagesHint': '团队邮箱文本将写入文件。',
+  'export.messagesWarning': '已选择包含消息。文件将包含已保留的团队邮箱文本，其中可能含敏感信息。',
+  'export.download': '下载导出文件',
+  'export.downloading': '正在准备下载…',
+  'export.error': '无法创建导出文件：{message}',
+  'export.unknownError': '未知错误',
+  'export.mismatch': '导出响应与当前团队不匹配。',
+  'export.done': '下载就绪：{filename}',
 } satisfies Record<TeamAgentsKey, string>;
 
 export const locales = { en, zh };

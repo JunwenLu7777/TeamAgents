@@ -14,6 +14,7 @@ import { TeamPlanSchema, TeamSchema, type Team, type TeamPlan, type TeamModelOpt
 import { registerTeamRemote } from '../src/remote.js';
 import { mountTeamRemote, type MountedTeamRemote } from '../src/remote-client.js';
 import { TEAM_REMOTE, TEAM_REMOTE_ENDPOINTS, type TeamRemoteAction } from '../src/remote-contract.js';
+import { TeamRunExportDocumentSchema, type TeamRunExportResult } from '../src/run-export-contract.js';
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface PrincipalMap { 'team-transport-test': { readonly kind: 'team-transport-test'; readonly id: string }; }
@@ -91,7 +92,7 @@ async function fixture() {
   }
   const captain = actor('captain');
   function call<Action extends TeamRemoteAction>(method: Action, request: unknown = { sessionId: 'captain' }, peer: PeerScope = owner, signal?: AbortSignal) {
-    return host.typertGateway.invoke({ namespace: 'teamAgents', method, args: { request }, peer, signal }) as Promise<Action extends 'models' ? TeamModelOption[] : Team | null>;
+    return host.typertGateway.invoke({ namespace: 'teamAgents', method, args: { request }, peer, signal }) as Promise<Action extends 'models' ? TeamModelOption[] : Action extends 'exportRun' ? TeamRunExportResult : Team | null>;
   }
   const save = (value = plan(), expectedRevision: number | null = null, sessionId = 'captain') =>
     call('save', { sessionId, expectedRevision, plan: value }) as Promise<Team>;
@@ -136,9 +137,9 @@ async function clientFixture(h: Awaited<ReturnType<typeof fixture>>, peer: PeerS
 describe('current SDK native TeamAgents Remote descriptors', () => {
   it('registers real strict descriptors and session resource markers for every action', async () => {
     const h = await fixture();
-    expect(TEAM_REMOTE.descriptors).toHaveLength(6);
+    expect(TEAM_REMOTE.descriptors).toHaveLength(7);
     const markers = remoteMethods(h.host.get('teamAgents'));
-    expect(markers.map(marker => marker.method).sort()).toEqual(['models', 'read', 'retry', 'save', 'start', 'stop']);
+    expect(markers.map(marker => marker.method).sort()).toEqual(['exportRun', 'models', 'read', 'retry', 'save', 'start', 'stop']);
     for (const action of Object.keys(TEAM_REMOTE_ENDPOINTS) as TeamRemoteAction[]) {
       const endpoint = TEAM_REMOTE_ENDPOINTS[action];
       const descriptor = h.host.typert.local.get(endpoint)!;
@@ -171,6 +172,94 @@ describe('current SDK native TeamAgents Remote descriptors', () => {
   });
 });
 function descriptorResult(action: TeamRemoteAction) { return TEAM_REMOTE.methods[TEAM_REMOTE_ENDPOINTS[action]]!.result.create(); }
+
+describe('read-only run export over the real native Gateway', () => {
+  it('exports a cold retained snapshot without activation, catalog queries or mutation', async () => {
+    const h = await fixture(); const saved = await h.save();
+    saved.members[0]!.instructions = 'PRIVATE_ROLE_INSTRUCTIONS';
+    saved.messages.push({ id: 'm', from: 'captain', to: 'researcher', text: 'PRIVATE_MAILBOX', createdAt: 'now' });
+    h.rows.set('captain', saved); h.actors.delete('captain'); h.sessions.delete('captain');
+    h.listModels.mockClear(); h.listProviders.mockClear();
+    const before = structuredClone(h.rows.get('captain'));
+    const exported = await h.call('exportRun', { sessionId: 'captain', format: 'json' });
+    const doc = TeamRunExportDocumentSchema.parse(JSON.parse(exported.content));
+    expect(doc).toMatchObject({ ownerSessionId: 'captain', sourceRevision: saved.revision, includeMessages: false });
+    expect(doc).not.toHaveProperty('messages');
+    expect(exported.content).not.toContain('PRIVATE_ROLE_INSTRUCTIONS'); expect(exported.content).not.toContain('PRIVATE_MAILBOX');
+    expect(h.rows.get('captain')).toEqual(before);
+    for (const fn of [h.createAgent, h.resolveAgent, h.listModels, h.listProviders, h.defaultSelection, h.driver.run, h.driver.deliver, h.stream]) expect(fn).not.toHaveBeenCalled();
+  });
+  it('preserves export domain failures instead of flattening them to successful replies', async () => {
+    const h = await fixture();
+    await expect(h.call('exportRun', { sessionId: 'captain', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/no-team' });
+    const saved = await h.save(); Object.assign(saved.tasks[0]!, { status: 'PRIVATE_BAD_STATE' }); h.rows.set('captain', saved);
+    await expect(h.call('exportRun', { sessionId: 'captain', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/export-invalid-snapshot' });
+    saved.tasks[0]!.status = 'pending'; saved.tasks[0]!.output = 'x'.repeat(8 * 1024 * 1024); h.rows.set('captain', saved);
+    await expect(h.call('exportRun', { sessionId: 'captain', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/export-too-large' });
+    expect(h.driver.run).not.toHaveBeenCalled(); expect(h.resolveAgent).not.toHaveBeenCalled();
+  });
+  it('rejects forged selectors and invalid options before any data lookup', async () => {
+    const h = await fixture();
+    for (const request of [
+      { sessionId: 'captain', format: 'html' }, { sessionId: 'captain', format: 'json', includeMessages: 'true' },
+      { sessionId: 'captain', format: 'json', ownerSessionId: 'other' }, { sessionId: 'captain', format: 'json', path: '/tmp/out.json' },
+      { sessionId: 'captain', format: 'json', principal: { kind: 'owner' } },
+    ]) await expect(h.call('exportRun', request)).rejects.toMatchObject({ code: 'gateway/input-invalid' });
+    expect(h.inspect).not.toHaveBeenCalled(); expect(h.rows.size).toBe(0);
+  });
+  it('requires authenticated owner provenance even when a guest is granted the endpoint', async () => {
+    const h = await fixture();
+    const request = { sessionId: 'captain', format: 'json', includeMessages: false };
+    await expect(h.host.get('teamAgents').exportRun(request, new AbortController().signal)).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+    await expect(h.call('exportRun', request, h.guest)).rejects.toMatchObject({ code: 'remote-access/denied' });
+    h.host.remoteAccess.registerPolicy('team-transport-test', { bindings: () => [{
+      role: { name: 'test export grant', resource: 'session', actions: [TEAM_REMOTE_ENDPOINTS.exportRun] },
+      resource: { kind: 'session', id: SessionId('captain') },
+    }] });
+    await expect(h.call('exportRun', request, h.guest)).rejects.toMatchObject({ code: 'team-agents/owner-required' });
+    expect(h.inspect).not.toHaveBeenCalled();
+  });
+  it('keeps two owners isolated and refuses archived, delegated or mismatched stored state', async () => {
+    const h = await fixture(); const saved = await h.save(); h.actor('other');
+    await h.save({ ...plan(), name: 'OTHER_TEAM' }, null, 'other');
+    const a = await h.call('exportRun', { sessionId: 'captain', format: 'json' });
+    const b = await h.call('exportRun', { sessionId: 'other', format: 'json' });
+    expect(a.content).not.toContain('OTHER_TEAM'); expect(b.ownerSessionId).toBe('other');
+    h.actor('child', { origin: 'subagent' });
+    await expect(h.call('exportRun', { sessionId: 'child', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/session-unavailable' });
+    h.archived.push(SessionId('captain'));
+    await expect(h.call('exportRun', { sessionId: 'captain', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/session-unavailable' });
+    h.archived.length = 0; h.rows.set('captain', { ...saved, ownerSessionId: 'other' });
+    await expect(h.call('exportRun', { sessionId: 'captain', format: 'json' })).rejects.toMatchObject({ code: 'team-agents/workspace-mismatch' });
+  });
+  it.each(['cancel', 'replace-agent', 'archive', 'dispose-peer', 'unload'] as const)('refuses export when %s occurs during authorization', async change => {
+    const h = await fixture(); const saved = await h.save();
+    const entered = deferred<void>(); const lookup = deferred<typeof h.workspace>();
+    h.resolveByPath.mockImplementation(async () => { entered.resolve(); return lookup.promise; });
+    const abort = new AbortController();
+    const pending = h.call('exportRun', { sessionId: 'captain', format: 'json' }, h.owner, abort.signal);
+    const rejected = expect(pending).rejects.toThrow(); await entered.promise;
+    if (change === 'cancel') abort.abort();
+    if (change === 'replace-agent') h.actors.set('captain', { ...h.captain } as Agent);
+    if (change === 'archive') h.archived.push(SessionId('captain'));
+    if (change === 'dispose-peer') await h.owner.dispose();
+    if (change === 'unload') await h.remoteFiber.dispose();
+    lookup.resolve(h.workspace); await rejected;
+    expect(h.rows.get('captain')).toEqual(saved); expect(h.resolveAgent).not.toHaveBeenCalled();
+  });
+  it('round-trips an escaped multi-megabyte export through real host/client codecs without HTTP or model calls', async () => {
+    const h = await fixture(); const saved = await h.save();
+    saved.tasks[0]!.output = '中文\\"\\n'.repeat(100_000); h.rows.set('captain', saved);
+    const c = await clientFixture(h);
+    const originalCall = c.connection.rpc.call.bind(c.connection.rpc);
+    vi.spyOn(c.connection.rpc, 'call').mockImplementation(async (...args) => JSON.parse(JSON.stringify(await originalCall(...args))));
+    const result = await c.actions.forSession('captain').exportRun({ format: 'json' });
+    expect(JSON.parse(result.content).team.tasks[0].output).toBe(saved.tasks[0]!.output);
+    expect(result.byteLength).toBeGreaterThan(1_000_000); expect(c.calls[0]!.endpoint).toBe('teamAgents/exportRun');
+    expect(h.resolveAgent).not.toHaveBeenCalled(); expect(h.stream).not.toHaveBeenCalled();
+    await c.fiber.dispose(); await expect(c.actions.forSession('captain').exportRun({ format: 'json' })).rejects.toThrow();
+  });
+});
 
 describe('owner provenance, root isolation, and cancellation', () => {
   it('requires an owner invocation even when an unrelated native policy grants a guest access', async () => {

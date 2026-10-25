@@ -9,6 +9,8 @@ import type {} from '@deepseek-ai/dsh-typert-registry';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type { TeamEngine } from './engine.js';
 import type { Team, TeamModelOption } from './model.js';
+import { buildTeamRunExport } from './run-export.js';
+import { TeamRunExportError, type TeamRunExportResult } from './run-export-contract.js';
 import {
   TEAM_REMOTE, TEAM_REMOTE_PACKAGE, TEAM_REMOTE_SERVICE, TeamRemoteRequests,
   type TeamRemoteAction, type TeamRemoteRequest,
@@ -106,7 +108,7 @@ class TeamRemoteService extends TypertRemoteService {
     try { return await action(); }
     catch (error) {
       if (remoteErrorOf(error)) throw error;
-      if (error instanceof TeamModelError) throw new RemoteError(error.code, error.message, {});
+      if (error instanceof TeamModelError || error instanceof TeamRunExportError) throw new RemoteError(error.code, error.message, {});
       // Keep actionable engine CAS/plan diagnostics on the native failure face.
       // Gateway cancellation takes precedence if the carrier was cancelled.
       throw new RemoteError('team-agents/operation-rejected', error instanceof Error ? error.message : 'Team operation failed.', {}, { cause: error });
@@ -119,6 +121,19 @@ class TeamRemoteService extends TypertRemoteService {
     const captain = await this.captain('read', input.sessionId, signal);
     captain.check();
     return this.engine.snapshot(captain.owner);
+  }
+
+  @Remote({ resources: { session: sessionResource } })
+  async exportRun(request: TeamRemoteRequest<'exportRun'>, signal: AbortSignal): Promise<TeamRunExportResult> {
+    const input = TeamRemoteRequests.exportRun.parse(request);
+    const captain = await this.captain('exportRun', input.sessionId, signal);
+    return this.operation(async () => {
+      captain.check();
+      const snapshot = this.engine.snapshot(captain.owner);
+      const result = buildTeamRunExport(snapshot, { format: input.format, includeMessages: input.includeMessages });
+      captain.check();
+      return result;
+    });
   }
 
   @Remote({ resources: { session: sessionResource } })

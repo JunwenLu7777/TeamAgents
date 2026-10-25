@@ -7,6 +7,7 @@ import { registerTeamConversationView, TEAM_CONVERSATION_VIEW_ID } from '../../s
 import { zh, type TeamTranslate } from '../../src/locales.js';
 import { TeamSchema } from '../../src/model.js';
 import type { TeamSettingsActions } from '../../src/settings-contract.js';
+import { TEAM_RUN_EXPORT_SCHEMA_VERSION, type TeamRunExportResult } from '../../src/run-export-contract.js';
 
 type Scenario = { id: string; width: number; height: number; theme: 'light' | 'dark'; mode: 'team' | 'empty' };
 const scenario = JSON.parse(decodeURIComponent(location.hash.slice(1))) as Scenario;
@@ -30,9 +31,24 @@ function forbidden(name: string): never { calls.push(name); throw new Error(`Une
 Object.defineProperty(window, 'fetch', { value: () => forbidden('fetch') });
 for (const key of ['WebSocket', 'XMLHttpRequest', 'EventSource'] as const) Object.defineProperty(window, key, { value: class { constructor() { forbidden(key); } } });
 for (const key of ['getItem', 'setItem', 'removeItem', 'clear'] as const) Object.defineProperty(Storage.prototype, key, { value: () => forbidden(`Storage.${key}`) });
+// Export is the only fixture-allowed Remote call; it returns a synthetic
+// envelope and never contacts a host, model, or real session.
+const exportCalls: Array<{ format: string; includeMessages: unknown }> = [];
+const fixtureContent = '# 隔离导出夹具\n\n仅包含合成数据。\n';
+const fixtureResult: TeamRunExportResult = {
+  schemaVersion: TEAM_RUN_EXPORT_SCHEMA_VERSION, teamId: snapshot.id, ownerSessionId: snapshot.ownerSessionId,
+  sourceRevision: snapshot.revision, exportedAt: '2026-10-25T12:00:00.000Z', format: 'markdown',
+  includeMessages: false, filename: 'team-agents-fixture-team-r5-20261025T120000000Z.md',
+  mimeType: 'text/markdown;charset=utf-8', content: fixtureContent,
+  byteLength: new TextEncoder().encode(fixtureContent).byteLength,
+};
 const actions: TeamSettingsActions = {
   read: async () => forbidden('read'), models: async () => forbidden('models'), save: async () => forbidden('save'),
   start: async () => forbidden('start'), stop: async () => forbidden('stop'), retry: async () => forbidden('retry'),
+  exportRun: async options => {
+    exportCalls.push({ format: options.format, includeMessages: options.includeMessages });
+    return fixtureResult;
+  },
 };
 
 const core = new SlotCore();
@@ -114,6 +130,71 @@ async function checkLayout() {
     record('there is no Start control', ![...page.querySelectorAll('button')].some(button => /启动|Start/.test(button.textContent ?? '')), null),
   );
   main.scrollTop = 0; await settle();
+  if (scenario.mode !== 'empty') await checkExport(page);
   return { scenario, pass: checks.every(check => check.pass), checks };
+}
+
+// The browser download lifecycle is observed without writing a real file:
+// anchor activation is intercepted, while Blob/ObjectURL creation and
+// revocation still run through the real helper implementation.
+const downloadAttempts: Array<{ filename: string | null; href: string; connected: boolean }> = [];
+const objectUrls = { created: [] as string[], revoked: [] as string[] };
+const nativeCreateObjectURL = URL.createObjectURL.bind(URL);
+const nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+URL.createObjectURL = blob => { const url = nativeCreateObjectURL(blob); objectUrls.created.push(url); return url; };
+URL.revokeObjectURL = url => { objectUrls.revoked.push(url); nativeRevokeObjectURL(url); };
+const nativeAnchorClick = HTMLAnchorElement.prototype.click;
+HTMLAnchorElement.prototype.click = function click(this: HTMLAnchorElement) {
+  downloadAttempts.push({ filename: this.getAttribute('download'), href: this.getAttribute('href') ?? '', connected: this.isConnected });
+};
+
+async function checkExport(page: HTMLElement) {
+  await settle();
+  const panel = page.querySelector<HTMLElement>('.dta-export')!;
+  const radios = [...(panel?.querySelectorAll<HTMLInputElement>('input[type=radio]') ?? [])];
+  const checkbox = panel?.querySelector<HTMLInputElement>('input[type=checkbox]');
+  const button = panel?.querySelector<HTMLButtonElement>('button.dta-download');
+  const markdown = radios.find(radio => radio.value === 'markdown');
+  checks.push(
+    record('export panel is present with Markdown selected and messages excluded by default',
+      !!panel && markdown?.checked === true && checkbox?.checked === false, { radios: radios.map(radio => [radio.value, radio.checked]), includeMessages: checkbox?.checked }),
+    record('export panel states the retained-snapshot limit and sensitive-content warning',
+      /不是完整的历史尝试记录/.test(panel?.textContent ?? '') && /可能包含敏感信息/.test(panel?.textContent ?? ''), panel?.textContent?.slice(0, 240)),
+    record('export controls are keyboard reachable native controls without a Start button',
+      button?.tagName === 'BUTTON' && button.type === 'button' && button.tabIndex === 0 && radios.every(radio => radio.closest('label') !== null) && checkbox?.closest('label') !== null
+        && ![...page.querySelectorAll('button')].some(candidate => /启动|Start/.test(candidate.textContent ?? '')), null),
+    record('no download happens before an explicit click', downloadAttempts.length === 0 && exportCalls.length === 0, { downloadAttempts, exportCalls }),
+  );
+  button?.focus();
+  checks.push(record('the download button accepts keyboard focus', document.activeElement === button, document.activeElement?.tagName ?? null));
+  button?.click();
+  await settle();
+  const attempt = downloadAttempts[0];
+  checks.push(
+    record('one explicit click requests exactly one default Markdown export',
+      exportCalls.length === 1 && exportCalls[0]?.format === 'markdown' && exportCalls[0]?.includeMessages === false, exportCalls),
+    record('one Blob download is triggered with the validated filename and allocated object URL',
+      downloadAttempts.length === 1 && attempt?.filename === fixtureResult.filename && attempt?.href === objectUrls.created[0] && attempt?.connected === true, { attempt, objectUrls: objectUrls.created }),
+    record('the temporary anchor is removed and its object URL revoked after use',
+      document.querySelectorAll('a[download]').length === 0 && objectUrls.created.length === 1
+        && objectUrls.revoked.length === 1 && objectUrls.revoked[0] === objectUrls.created[0],
+      { created: objectUrls.created, revoked: objectUrls.revoked, anchors: document.querySelectorAll('a[download]').length }),
+    record('no download or Remote call occurs for an option change alone', (() => {
+      const before = downloadAttempts.length;
+      radios.find(radio => radio.value === 'json')!.click();
+      const unchanged = downloadAttempts.length === before && exportCalls.length === 1;
+      markdown!.click();
+      return unchanged;
+    })(), { downloadAttempts, exportCalls }),
+    record('including messages requires an explicit opt-in with a privacy notice', (() => {
+      checkbox!.click();
+      const warning = panel?.querySelector("[role='note']")?.textContent ?? '';
+      const warned = /已选择包含消息/.test(warning) && /敏感信息/.test(warning);
+      checkbox!.click();
+      return warned && panel?.querySelector("[role='note']") === null;
+    })(), panel?.querySelector("[role='note']")?.textContent ?? null),
+    record('export interaction caused no other Remote call, model call, or storage access', calls.length === 0 && exportCalls.length === 1, { calls, exportCalls }),
+  );
+  HTMLAnchorElement.prototype.click = nativeAnchorClick;
 }
 Object.assign(window, { layoutFixture: { prepare, checkLayout } });

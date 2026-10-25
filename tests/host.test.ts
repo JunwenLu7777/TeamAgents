@@ -5,6 +5,7 @@ import { Session, SessionId, pluginRecordOf } from '@deepseek-ai/dsh-session';
 import { assertSupportedJsonSchema, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { apply, inject, teamDomain } from '../src/index.js';
 import type { Team } from '../src/model.js';
+import type { TeamRunExportResult } from '../src/run-export-contract.js';
 import { agentLibraryDomain } from '../src/agent-library.js';
 import type { AgentLibrary } from '../src/library-model.js';
 import { registerTeamRemote } from '../src/remote.js';
@@ -36,14 +37,19 @@ async function host(initialTeams: Team[] = []) {
   });
   const contextPrompt = vi.fn();
   const createAgent = vi.fn();
+  const runtimeChildren = new Set<string>();
+  const archived: ReturnType<typeof SessionId>[] = [];
+  const workspace = { id: 'workspace' };
+  const resolveByPath = vi.fn(async (_cwd: string) => workspace);
   const listProviders = vi.fn(() => [{ id: 'configured', name: 'Configured provider' }]);
   const listModels = vi.fn(async () => [{ provider: 'configured', id: 'selected', name: 'Selected model' }]);
   const context = {
     llm: { listProviders, listModels },
     storageDomain: { open },
-    agents: { get: (id: string) => actors.get(id), create: createAgent },
+    agents: { get: (id: string) => actors.get(id), create: createAgent,
+      roots: () => [...actors.values()].filter(agent => !runtimeChildren.has(agent.id)) },
     sessions: { get: (id: string) => actors.get(id)?.session },
-    workspaceRegistry: { resolveByPath: async () => ({ id: 'workspace' }) },
+    workspaceRegistry: { resolveByPath, get: (id: string) => id === workspace.id ? workspace : undefined, archivedSessionIds: archived },
     tools: { register: (tool: ToolDefinition) => { tools.set(tool.name, tool); } },
     sessionProjections: { register: vi.fn() },
     systemPrompt: { context: contextPrompt, getContextOrder: () => 125 },
@@ -65,7 +71,7 @@ async function host(initialTeams: Team[] = []) {
   }
   const dispose = async () => { for (const effect of [...effects].reverse()) await effect(); };
   return { rows, libraryRows, library, engine, open, putTeam, putLibrary, tools, actors, handlers, captain, actor, call,
-    close, closeLibrary, createAgent, dispose, listProviders, listModels, contextPrompt };
+    close, closeLibrary, createAgent, dispose, listProviders, listModels, contextPrompt, workspace, resolveByPath, archived, runtimeChildren };
 }
 
 function deferred<T>() {
@@ -261,6 +267,63 @@ describe('global library to conversation snapshots', () => {
   });
 });
 
+describe('chat export tool authority and non-mutating behavior', () => {
+  it('exports only the current captain snapshot and excludes messages by default', async () => {
+    const h = await host();
+    await h.call('create', { name: 'Export team', goal: 'Inspect' });
+    await h.call('add_member', { name: 'reader', role: 'Read', instructions: 'PRIVATE_INSTRUCTIONS' });
+    await h.call('message', { to: 'reader', text: 'PRIVATE_MAILBOX' });
+    const before = structuredClone(h.rows.get('captain'));
+    const seq = h.captain.session.seq; h.putTeam.mockClear();
+    const result = await h.call<TeamRunExportResult>('export_run', { format: 'json' });
+    expect(result.ownerSessionId).toBe('captain'); expect(result.sourceRevision).toBe(before!.revision);
+    expect(result.content).not.toContain('PRIVATE_INSTRUCTIONS'); expect(result.content).not.toContain('PRIVATE_MAILBOX');
+    const included = await h.call<TeamRunExportResult>('export_run', { format: 'markdown', includeMessages: true });
+    expect(included.content).toContain('PRIVATE_MAILBOX');
+    expect(h.rows.get('captain')).toEqual(before); expect(h.captain.session.seq).toBe(seq);
+    for (const fn of [h.putTeam, h.putLibrary, h.createAgent, h.listModels, h.listProviders]) expect(fn).not.toHaveBeenCalled();
+    await h.dispose();
+  });
+  it('distinguishes no team from a valid empty team', async () => {
+    const h = await host();
+    await expect(h.call('export_run', { format: 'json' })).rejects.toMatchObject({ code: 'team-agents/no-team' });
+    await h.call('create', { name: 'Empty', goal: 'Not started' });
+    expect(JSON.parse((await h.call<TeamRunExportResult>('export_run', { format: 'json' })).content).team.tasks).toEqual([]);
+    await h.dispose();
+  });
+  it.each([
+    { format: 'html' }, { format: 'json', includeMessages: 'true' },
+    { format: 'json', sessionId: 'other' }, { format: 'json', ownerSessionId: 'other' },
+    { format: 'json', path: '/tmp/secret.json' },
+  ])('rejects an invalid export or forged selector %j', async args => {
+    const h = await host(); await expect(h.call('export_run', args)).rejects.toThrow();
+    expect(h.resolveByPath).not.toHaveBeenCalled(); expect(h.putTeam).not.toHaveBeenCalled(); await h.dispose();
+  });
+  it('refuses runtime children, archived sessions and mismatched saved ownership', async () => {
+    const h = await host(); const saved = (await h.call('create', { name: 'Team', goal: 'Goal' }))!;
+    const child = h.actor('runtime-child'); h.runtimeChildren.add(child.id);
+    await expect(h.call('export_run', { format: 'json' }, child)).rejects.toThrow('root');
+    h.archived.push(h.captain.id);
+    await expect(h.call('export_run', { format: 'json' })).rejects.toThrow('Archived'); h.archived.length = 0;
+    h.rows.set('captain', { ...saved, ownerSessionId: 'other' });
+    await expect(h.call('export_run', { format: 'json' })).rejects.toThrow('belong');
+    h.rows.set('captain', { ...saved, workspaceId: 'different' });
+    await expect(h.call('export_run', { format: 'json' })).rejects.toThrow('belong'); await h.dispose();
+  });
+  it.each(['cancel', 'replace', 'archive'] as const)('rechecks %s after the asynchronous workspace lookup', async change => {
+    const h = await host(); await h.call('create', { name: 'Team', goal: 'Goal' });
+    const gate = deferred<typeof h.workspace>(); const entered = deferred<void>();
+    h.resolveByPath.mockImplementation(async () => { entered.resolve(); return gate.promise; });
+    const abort = new AbortController();
+    const pending = h.call('export_run', { format: 'json' }, h.captain, abort.signal);
+    const rejected = expect(pending).rejects.toThrow(); await entered.promise;
+    if (change === 'cancel') abort.abort();
+    if (change === 'replace') h.actor('captain');
+    if (change === 'archive') h.archived.push(h.captain.id);
+    gate.resolve(h.workspace); await rejected; expect(h.createAgent).not.toHaveBeenCalled(); await h.dispose();
+  });
+});
+
 describe('dual-domain cleanup', () => {
   it('closes the existing domain when opening the library fails', async () => {
     const close = vi.fn(async () => {});
@@ -287,9 +350,9 @@ describe('dual-domain cleanup', () => {
 });
 
 describe('host plugin wiring and caller isolation', () => {
-  it('registers ten valid SDK tools and does not call a model while planning', async () => {
+  it('registers eleven valid SDK tools and does not call a model while planning', async () => {
     const h = await host();
-    expect(h.tools.size).toBe(10);
+    expect(h.tools.size).toBe(11);
     expect(registerTeamRemote).toHaveBeenCalled();
     expect(registerAgentLibraryRemote).toHaveBeenCalled();
     for (const tool of h.tools.values()) {

@@ -3,12 +3,51 @@ import type {} from '@deepseek-ai/dsh-api-gateway/client';
 import { TeamModelOptionsSchema, TeamSchema } from './model.js';
 import type { TeamSettingsActions } from './settings-contract.js';
 import {
+  TeamRunExportDocumentSchema,
+  TeamRunExportOptionsSchema,
+  TeamRunExportResultSchema,
+  type TeamRunExportOptions,
+  type TeamRunExportResult,
+} from './run-export-contract.js';
+import {
   TEAM_REMOTE, TEAM_REMOTE_ENDPOINTS, TeamSessionIdSchema,
   type TeamRemoteAction, type TeamRemoteRequest,
 } from './remote-contract.js';
 
 export interface MountedTeamRemote {
   forSession(sessionId: string): TeamSettingsActions;
+}
+
+/**
+ * Validate one export envelope against the bound session and the normalized
+ * request that produced it. Pure and transport-free so both the bound closure
+ * and its tests apply exactly the same ownership/consistency rules. Never
+ * parses Markdown to reconstruct ownership, and never mutates a projection.
+ */
+export function validateTeamRunExportResult(
+  value: unknown,
+  expected: TeamRunExportOptions & { sessionId: string },
+): TeamRunExportResult {
+  const normalized = TeamRunExportOptionsSchema.parse({ format: expected.format, includeMessages: expected.includeMessages });
+  const result = TeamRunExportResultSchema.parse(value);
+  // The bound closure must not surface another session's retained snapshot.
+  if (result.ownerSessionId !== expected.sessionId) throw new Error('Team export returned another captain session\'s snapshot');
+  // The envelope may not silently answer a different request than the one sent.
+  if (result.format !== normalized.format || result.includeMessages !== normalized.includeMessages) {
+    throw new Error('Team export response does not match the requested format and message scope');
+  }
+  if (expected.format === 'json') {
+    // JSON embeds the allowlisted document; verify it is the same snapshot.
+    let document;
+    try { document = TeamRunExportDocumentSchema.parse(JSON.parse(result.content)); }
+    catch { throw new Error('Team export returned an unreadable JSON snapshot'); }
+    if (document.teamId !== result.teamId || document.ownerSessionId !== result.ownerSessionId ||
+      document.sourceRevision !== result.sourceRevision || document.exportedAt !== result.exportedAt ||
+      document.includeMessages !== result.includeMessages) {
+      throw new Error('Team export JSON metadata does not match its envelope');
+    }
+  }
+  return result;
 }
 
 /** Await once per Client plugin apply, never in a component or session render. */
@@ -45,18 +84,26 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
         if (!result.ok) throw result.error;
         return result.value;
       }
-      async function call<Action extends Exclude<TeamRemoteAction, 'models'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      // Export is a text envelope, not a Team; never funnel it through TeamSchema.
+      async function call<Action extends Exclude<TeamRemoteAction, 'models' | 'exportRun'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const team = TeamSchema.nullable().parse(await invoke(action, request, signal));
         if (team && team.ownerSessionId !== boundId) throw new Error('Team settings received another captain session\'s state');
         return team;
       }
-      async function required<Action extends Exclude<TeamRemoteAction, 'read' | 'models'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
+      async function required<Action extends Exclude<TeamRemoteAction, 'read' | 'models' | 'exportRun'>>(action: Action, request: TeamRemoteRequest<Action>, signal?: AbortSignal) {
         const team = await call(action, request, signal);
         if (!team) throw new Error('Team settings mutation returned no saved team');
         return team;
       }
+      async function exportRun(options: TeamRunExportOptions, signal?: AbortSignal): Promise<TeamRunExportResult> {
+        const normalized = TeamRunExportOptionsSchema.parse(options);
+        return validateTeamRunExportResult(
+          await invoke('exportRun', { sessionId: boundId, ...normalized }, signal),
+          { sessionId: boundId, ...normalized },
+        );
+      }
       // Every closure keeps this exact session id; switching tabs cannot retarget
-      // an in-flight save, start, stop, or retry. Only the Host authorizes it.
+      // an in-flight save, start, stop, retry, or export. Only the Host authorizes it.
       return Object.freeze({
         read: (signal?: AbortSignal) => call('read', { sessionId: boundId }, signal),
         models: async (signal?: AbortSignal) => TeamModelOptionsSchema.parse(await invoke('models', { sessionId: boundId }, signal)),
@@ -64,6 +111,7 @@ export async function mountTeamRemote(ctx: Context): Promise<MountedTeamRemote> 
         start: (expectedRevision, signal) => required('start', { sessionId: boundId, expectedRevision }, signal),
         stop: (signal?: AbortSignal) => required('stop', { sessionId: boundId }, signal),
         retry: (taskId, expectedRevision, signal) => required('retry', { sessionId: boundId, taskId, expectedRevision }, signal),
+        exportRun,
       } satisfies TeamSettingsActions);
     },
   };

@@ -12,6 +12,7 @@ import type { TeamSettingsActions } from '../src/settings-contract.js';
 import { mountTeamRemote } from '../src/remote-client.js';
 import { mountAgentLibraryRemote } from '../src/library-remote-client.js';
 import { registerTeamSettings } from '../src/settings-integration.js';
+import { TEAM_REMOTE_ENDPOINTS } from '../src/remote-contract.js';
 
 // View glue stays independently testable; separate suites exercise real settings and Gateway wiring.
 vi.mock('../src/remote-client.js', () => ({ mountTeamRemote: vi.fn(async () => ({ forSession: vi.fn(() => ({ stop: vi.fn() })) })) }));
@@ -369,6 +370,7 @@ describe('current DSH client integration', () => {
     const otherActions = {
       read: vi.fn<TeamSettingsActions['read']>(), models: vi.fn<TeamSettingsActions['models']>(),
       save: vi.fn<TeamSettingsActions['save']>(), start: vi.fn<TeamSettingsActions['start']>(), retry: vi.fn<TeamSettingsActions['retry']>(),
+      exportRun: vi.fn<TeamSettingsActions['exportRun']>(),
     };
     const forSession = vi.fn((sessionId: string): TeamSettingsActions => ({
       ...otherActions, stop: signal => stop(sessionId, signal),
@@ -388,9 +390,15 @@ describe('current DSH client integration', () => {
     expect(forSession).toHaveBeenCalledWith('captain-session'); expect(stop).not.toHaveBeenCalled();
     useAccess.mockReturnValue(true);
     view.rerender(<Slot sessionId="captain-session" useAccess={useAccess} useProjection={useProjection} t={translator()} />);
+    // Export access is queried independently, but Stop itself must bind only the
+    // stop endpoint and must not invoke any other session action.
+    // Resolve the shared endpoint through the map so this assertion also pins the
+    // exact native ACL string once the transport descriptor is registered.
+    const exportEndpoint = (TEAM_REMOTE_ENDPOINTS as Record<string, string>).exportRun;
+    expect(exportEndpoint).toBe('teamAgents/exportRun');
+    expect([...new Set(useAccess.mock.calls.map(([endpoint]) => endpoint))].sort()).toEqual([exportEndpoint, 'teamAgents/stop']);
     fireEvent.click(screen.getByRole('button', { name: 'Stop team' }));
     await waitFor(() => expect(stop).toHaveBeenCalledWith('captain-session', expect.any(AbortSignal)));
-    expect(useAccess.mock.calls.every(([endpoint]) => endpoint === 'teamAgents/stop')).toBe(true);
     expect(forSession).toHaveBeenCalledOnce();
     for (const action of Object.values(otherActions)) expect(action).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: 'Start' })).toBeNull();

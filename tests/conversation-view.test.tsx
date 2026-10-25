@@ -29,7 +29,8 @@ function setup() {
   }
   const actions = { read: vi.fn<TeamSettingsActions['read']>(), models: vi.fn<TeamSettingsActions['models']>(),
     save: vi.fn<TeamSettingsActions['save']>(), start: vi.fn<TeamSettingsActions['start']>(),
-    stop: vi.fn<TeamSettingsActions['stop']>(), retry: vi.fn<TeamSettingsActions['retry']>() };
+    stop: vi.fn<TeamSettingsActions['stop']>(), retry: vi.fn<TeamSettingsActions['retry']>(),
+    exportRun: vi.fn<TeamSettingsActions['exportRun']>() };
   const forSession = vi.fn(() => actions);
   const cleanups: Array<() => void> = [];
   let Component!: ComponentType<any>;

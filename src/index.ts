@@ -13,6 +13,8 @@ import { requireInheritedTeamModel } from './model-route.js';
 import { DshTeamDriver } from './runtime.js';
 import { publishSnapshot, registerProjection } from './projection.js';
 import { registerTeamRemote } from './remote.js';
+import { buildTeamRunExport } from './run-export.js';
+import { TeamRunExportOptionsSchema } from './run-export-contract.js';
 
 export const name = 'team-agents';
 export const inject = [
@@ -171,6 +173,35 @@ export async function apply(ctx: Context): Promise<void> {
   register('status', 'Read the current team, task results, and mailbox. Members can read only their own team. Do not busy-poll; task completion delivers a captain notification.', {}, async (_args, exec) => {
     const agent = caller(exec); const member = engine.identity(agent.id);
     return engine.snapshot(member?.owner ?? agent.id);
+  });
+  register('export_run', 'Export this captain session’s currently retained run snapshot as Markdown or JSON text. Read-only: no team/model execution or host file writes. Not full attempt history or session transcripts. Messages are excluded unless explicitly requested; outputs and optional messages may contain sensitive data. Returns a filename, MIME type and content for the user to save.', {
+    format: { type: 'string', enum: ['markdown', 'json'], required: true, description: 'Download document format.' },
+    includeMessages: { type: 'boolean', description: 'Explicitly include the retained team mailbox. Default false; may contain sensitive data.' },
+  }, async (args, exec) => {
+    const options = TeamRunExportOptionsSchema.parse(args);
+    const agent = captain(exec);
+    const session = agent.session;
+    const cwd = session.header.cwd;
+    const check = () => {
+      if (captain(exec) !== agent || agent.session !== session || session.header.id !== agent.id ||
+        ctx.sessions.get(agent.id) !== session || !ctx.agents.roots().includes(agent) ||
+        (session.header.parentSession !== undefined && !session.header.isSeeded)) {
+        throw new Error('Export requires the exact current root captain session');
+      }
+      if (session.header.cwd !== cwd || !cwd) throw new Error('Captain workspace changed or is unavailable');
+      if (ctx.workspaceRegistry.archivedSessionIds.includes(agent.id)) throw new Error('Archived sessions cannot export team records');
+    };
+    check();
+    const workspace = await ctx.workspaceRegistry.resolveByPath(cwd!);
+    check();
+    if (!workspace || ctx.workspaceRegistry.get(workspace.id) !== workspace) throw new Error('Captain workspace is not registered');
+    const snapshot = engine.snapshot(agent.id);
+    if (snapshot && (snapshot.ownerSessionId !== agent.id || snapshot.workspaceId !== workspace.id)) {
+      throw new Error('Saved team does not belong to this captain and workspace');
+    }
+    const result = buildTeamRunExport(snapshot, options);
+    check();
+    return result;
   });
   register('message', 'Send attributed guidance within this team. A running recipient receives context at a later step; an idle member keeps a durable message for its next task. This does not start idle models.', {
     to: { ...str('Member name or captain.'), required: true }, text: { ...str('Message, at most 20,000 characters.'), required: true },

@@ -1,15 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { Task, Team } from './model.js';
 import type { TeamTranslate } from './locales.js';
 import type { TeamSettingsActions } from './settings-contract.js';
+import type { TeamRunExportFormat } from './run-export-contract.js';
+import { downloadTeamRunExport } from './run-export-download.js';
 
 export interface TeamDashboardProps {
   team: Team | null | undefined;
   sessionId?: string;
   canStop?: boolean;
+  /** Affirmative export authority only; unknown remains denied and shows no download control. */
+  canExport?: boolean;
   /** The native conversation tab uses an expanded normal-flow page, not a composer disclosure. */
   presentation?: 'compact' | 'page';
-  actions?: Pick<TeamSettingsActions, 'stop'>;
+  /** Stop stays required for existing consumers; export is optional read-only authority. */
+  actions?: Pick<TeamSettingsActions, 'stop'> & Partial<Pick<TeamSettingsActions, 'exportRun'>>;
   t: TeamTranslate;
 }
 
@@ -96,6 +101,22 @@ const styles = `
 .dsh-team-agents .dta-stop { min-height: 32px; padding: 4px 10px; border: 1px solid var(--dta-border); border-radius: 7px; background: var(--dta-fill); color: inherit; font: inherit; cursor: pointer; }
 .dsh-team-agents .dta-stop:disabled { opacity: .6; cursor: wait; }
 .dsh-team-agents .dta-error { margin: 8px 0 0; overflow-wrap: anywhere; }
+.dsh-team-agents .dta-export { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dta-border); }
+.dsh-team-agents .dta-export fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.dsh-team-agents .dta-export legend { padding: 0; font-size: 11px; font-weight: 650; }
+.dsh-team-agents .dta-export-hint, .dsh-team-agents .dta-export-privacy, .dsh-team-agents .dta-export-warning { margin: 6px 0 0; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.dsh-team-agents .dta-export-hint, .dsh-team-agents .dta-export-privacy { opacity: .78; }
+.dsh-team-agents .dta-export-warning { padding: 6px 9px; border: 1px solid currentColor; border-radius: 8px; }
+.dsh-team-agents .dta-export-sublabel { margin: 10px 0 0; font-size: 11px; font-weight: 600; }
+.dsh-team-agents .dta-export-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 4px; }
+.dsh-team-agents .dta-export-choice, .dsh-team-agents .dta-export-toggle { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; cursor: pointer; }
+.dsh-team-agents .dta-export-divider { flex: 0 1 auto; width: 1px; align-self: stretch; min-height: 18px; background: var(--dta-border); }
+.dsh-team-agents .dta-export input:focus-visible, .dsh-team-agents .dta-download:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.dsh-team-agents .dta-export input:disabled, .dsh-team-agents .dta-download:disabled { opacity: .6; cursor: not-allowed; }
+.dsh-team-agents .dta-download { min-height: 32px; padding: 4px 10px; margin-top: 8px; border: 1px solid var(--dta-border); border-radius: 7px; background: var(--dta-fill); color: inherit; font: inherit; cursor: pointer; }
+.dsh-team-agents .dta-download:disabled { cursor: wait; }
+.dsh-team-agents .dta-export-status { margin: 6px 0 0; font-size: 11px; opacity: .85; overflow-wrap: anywhere; }
+.dsh-team-agents .dta-export .dta-error { margin-top: 6px; }
 .dsh-team-agents.dta-page { margin: 0; font-size: 13px; }
 .dsh-team-agents.dta-page > .dta-summary { padding: 18px 20px; }
 .dsh-team-agents.dta-page .dta-name { font-size: 1.05rem; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
@@ -115,6 +136,93 @@ const styles = `
 
 function Badge({ status, t }: { status: Team['status'] | Task['status']; t: TeamTranslate }) {
   return <span className="dta-badge" data-status={status}>{t(`status.${status}`)}</span>;
+}
+
+const EXPORT_FORMATS: readonly TeamRunExportFormat[] = ['markdown', 'json'];
+
+/**
+ * Explicit, read-only export of the retained snapshot. It never runs on mount
+ * and never mutates projection or team state; a click captures identity and
+ * options, then downloads only a matching, non-stale, authorized envelope.
+ */
+function ExportPanel({ team, sessionId, actions, t }: {
+  team: Team; sessionId: string;
+  actions: NonNullable<TeamDashboardProps['actions']> & Required<Pick<TeamSettingsActions, 'exportRun'>>;
+  t: TeamTranslate;
+}) {
+  const ids = useId();
+  const request = useRef<AbortController | null>(null);
+  const cleanupDownload = useRef<(() => void) | null>(null);
+  const [format, setFormat] = useState<TeamRunExportFormat>('markdown');
+  const [includeMessages, setIncludeMessages] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  useEffect(() => {
+    // A replacement binding cancels its predecessor and must also release the busy UI.
+    setBusy(false); setError(null); setDone(null);
+    // Unmount, a replaced actions binding or a lost authority cancels the request.
+    return () => {
+      request.current?.abort(new Error('Team export disposed')); request.current = null;
+      cleanupDownload.current?.(); cleanupDownload.current = null;
+    };
+  }, [actions]);
+
+  async function start() {
+    if (request.current) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setBusy(true); setError(null); setDone(null);
+    // Capture the click-time team, session and options; late results cannot retarget.
+    const captured = { teamId: team.id, revision: team.revision, format, includeMessages } as const;
+    try {
+      const result = await actions.exportRun({ format: captured.format, includeMessages: captured.includeMessages }, controller.signal);
+      if (controller.signal.aborted) return;
+      if (result.ownerSessionId !== sessionId || result.teamId !== captured.teamId ||
+        result.format !== captured.format || result.includeMessages !== captured.includeMessages ||
+        result.sourceRevision < captured.revision) throw new Error(t('export.mismatch'));
+      // A completed envelope is the only thing that may allocate a browser
+      // resource, and its cleanup is retained until the panel is disposed.
+      cleanupDownload.current?.();
+      cleanupDownload.current = downloadTeamRunExport(result);
+      if (controller.signal.aborted) return;
+      setDone(t('export.done', { filename: result.filename }));
+    } catch (failure) {
+      if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : t('export.unknownError'));
+    } finally {
+      if (request.current === controller) { request.current = null; setBusy(false); }
+    }
+  }
+
+  return <section className="dta-export" aria-label={t('export.heading')}>
+    <fieldset>
+      <legend>{t('export.heading')}</legend>
+      <p className="dta-export-hint">{t('export.hint')}</p>
+      <p className="dta-export-sublabel" id={`${ids}-format`}>{t('export.format')}</p>
+      <div className="dta-export-options" role="radiogroup" aria-labelledby={`${ids}-format`}>
+        {EXPORT_FORMATS.map(value => <label className="dta-export-choice" key={value}>
+          <input type="radio" name={`${ids}-format`} value={value} checked={format === value}
+            disabled={busy} onChange={() => setFormat(value)} />
+          <span>{t(value === 'json' ? 'export.formatJson' : 'export.formatMarkdown')}</span>
+        </label>)}
+        <span className="dta-export-divider" aria-hidden="true" />
+        <label className="dta-export-toggle">
+          <input type="checkbox" checked={includeMessages} disabled={busy}
+            onChange={event => setIncludeMessages(event.currentTarget.checked)} />
+          <span>{t('export.includeMessages')}</span>
+        </label>
+      </div>
+      <p className="dta-export-hint">{t('export.includeMessagesHint')}</p>
+      <p className="dta-export-privacy">{t('export.privacy')}</p>
+      {includeMessages && <p className="dta-export-warning" role="note">{t('export.messagesWarning')}</p>}
+      <button type="button" className="dta-download" disabled={busy} onClick={() => { void start(); }}>
+        {t(busy ? 'export.downloading' : 'export.download')}
+      </button>
+      {busy && <p className="dta-export-status" role="status">{t('export.downloading')}</p>}
+      {done && <p className="dta-export-status" role="status">{done}</p>}
+      {error && <p className="dta-error" role="alert">{t('export.error', { message: error })}</p>}
+    </fieldset>
+  </section>;
 }
 
 // Display-only explanation of model.blockingReason's precedence. The host
@@ -138,7 +246,7 @@ export function TeamDashboard(props: TeamDashboardProps) {
   return <TeamDashboardState key={`${sessionId ?? 'readonly'}:${team.id}`} {...props} team={team} />;
 }
 
-function TeamDashboardState({ team: projected, sessionId, canStop = false, presentation = 'compact', actions, t }: TeamDashboardProps & { team: Team }) {
+function TeamDashboardState({ team: projected, sessionId, canStop = false, canExport = false, presentation = 'compact', actions, t }: TeamDashboardProps & { team: Team }) {
   const page = presentation === 'page';
   const Frame = page ? 'section' : 'details';
   const Header = page ? 'header' : 'summary';
@@ -149,6 +257,8 @@ function TeamDashboardState({ team: projected, sessionId, canStop = false, prese
   // A completed Stop can precede its projection. An older projection must not restore a running button.
   const team = stopResult && stopResult.revision > projected.revision ? stopResult : projected;
   const canManage = canStop && sessionId === team.ownerSessionId && !!actions;
+  // Export needs affirmative authority, a bound session and the read-only action.
+  const canDownload = canExport && !!sessionId && sessionId === team.ownerSessionId && !!actions?.exportRun;
   useEffect(() => {
     setStopping(false); setError(null);
     return () => { request.current?.abort(); request.current = null; };
@@ -255,6 +365,8 @@ function TeamDashboardState({ team: projected, sessionId, canStop = false, prese
         </section>
       </div>
       <div className="dta-footer">
+        {canDownload && <ExportPanel key={`${sessionId}:${team.id}`} team={team} sessionId={sessionId}
+          actions={actions as NonNullable<TeamDashboardProps['actions']> & Required<Pick<TeamSettingsActions, 'exportRun'>>} t={t} />}
         <div className="dta-controls">
           <p className="dta-hint">{t('team.chatHint')}</p>
           {canManage && (team.status === 'running' || stopping) && <button type="button" className="dta-stop"
