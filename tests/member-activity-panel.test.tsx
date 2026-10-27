@@ -14,6 +14,11 @@ function frame(overrides: Partial<MemberActivity> = {}): MemberActivity {
     entries: [{ id: 'event-3', seq: 3, time: Date.now(), kind: 'tool', label: 'read', text: '', arguments: '{"file_path":"README.md"}', truncated: false, status: 'running' }],
     historyTruncated: false, liveOutput: 'Inspecting the code…', liveTruncated: false, livePartial: false, ...overrides };
 }
+function noSession(status: 'not-started' | 'failed' = 'not-started'): MemberActivity {
+  return frame({ childSessionId: null, status, live: false, phase: 'idle', cursor: -1,
+    startedAt: null, endedAt: null, elapsedMs: null, lastActivityAt: null, entries: [], liveOutput: '',
+    task: status === 'failed' ? { id: 'read', subject: 'Read sources', status: 'failed', error: 'Model unavailable before session creation' } : null });
+}
 function fixture() {
   const subscriptions: Array<{ signal?: AbortSignal; push(value: MemberActivity): void; fail(error: Error): void }> = [];
   const closed = vi.fn();
@@ -44,6 +49,54 @@ function fixture() {
 afterEach(cleanup);
 
 describe('member activity detail UI', () => {
+  it.each(['not-started', 'failed'] as const)('treats a normal %s snapshot without a session as ready, not disconnected', async status => {
+    const watch = vi.fn(async function* (_member: string, _signal?: AbortSignal) { yield noSession(status); });
+    render(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={{ name: 'reader', role: 'Read source' }} watch={watch} t={t} onClose={vi.fn()} />);
+    await screen.findByText('Snapshot ready · no member session');
+    expect(screen.queryByText(/Disconnected: the information below/)).toBeNull();
+    expect(screen.getByRole('status').textContent).not.toContain('Stream ended');
+    if (status === 'failed') expect(screen.getByRole('alert').textContent).toContain('Model unavailable before session creation');
+    else expect(screen.queryByRole('alert')).toBeNull();
+    expect(watch).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh snapshot' }));
+    await waitFor(() => expect(watch).toHaveBeenCalledTimes(2));
+    await screen.findByText('Snapshot ready · no member session');
+    expect(watch.mock.calls[0]![1]!.aborted).toBe(true);
+  });
+  it('does not hide a real failure occurring after a no-session snapshot', async () => {
+    const watch = async function* () { yield noSession(); throw new Error('Transport lost after snapshot'); };
+    render(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={{ name: 'reader', role: 'Read source' }} watch={watch} t={t} onClose={vi.fn()} />);
+    expect((await screen.findByRole('alert')).textContent).toContain('Transport lost after snapshot');
+    expect(screen.queryByText('Snapshot ready · no member session')).toBeNull();
+    expect(screen.getByText(/Disconnected: the information below/)).toBeTruthy();
+  });
+  it('keeps a terminated active member stream visibly disconnected', async () => {
+    render(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={{ name: 'reader', role: 'Read source', sessionId: 'child' }}
+      watch={async function* () { yield frame(); }} t={t} onClose={vi.fn()} />);
+    await screen.findByText('Stream ended · reconnect to refresh');
+    expect(screen.getByText(/Disconnected: the information below/)).toBeTruthy();
+    expect(screen.queryByText('Snapshot ready · no member session')).toBeNull();
+  });
+  it('does not invent a successful snapshot when a stream ends without a frame', async () => {
+    render(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={{ name: 'reader', role: 'Read source' }}
+      watch={async function* () { return; }} t={t} onClose={vi.fn()} />);
+    await screen.findByText('Stream ended · reconnect to refresh');
+    expect(screen.queryByText('Snapshot ready · no member session')).toBeNull();
+  });
+  it('opens a fresh live subscription when a previously absent member session becomes available', async () => {
+    const h = fixture(); let requests = 0;
+    const watch = vi.fn((name: string, signal?: AbortSignal) => ++requests === 1
+      ? (async function* () { yield noSession(); })() : h.watch(name, signal));
+    const view = render(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={{ name: 'reader', role: 'Read source' }} watch={watch} t={t} onClose={vi.fn()} />);
+    await screen.findByText('Snapshot ready · no member session');
+    view.rerender(<MemberActivityPanel ownerSessionId="captain" teamId="team" member={h.team.members[0]!} watch={watch} t={t} onClose={vi.fn()} />);
+    expect(watch.mock.calls[0]![1]!.aborted).toBe(true);
+    await act(async () => h.subscriptions[0]!.push(frame()));
+    expect(screen.getByRole('status').textContent).toContain('Connected');
+    expect(screen.getByText('Inspecting the code…')).toBeTruthy();
+    expect(screen.queryByText('Snapshot ready · no member session')).toBeNull();
+    expect(watch).toHaveBeenCalledTimes(2);
+  });
   it('requires explicit selection and affirmative authority, without starting or stopping any work', async () => {
     const h = fixture();
     const view = render(<TeamDashboard team={h.team} sessionId="captain" presentation="page" actions={h.actions} canInspect={false} t={t} />);

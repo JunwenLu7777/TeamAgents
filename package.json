@@ -1,6 +1,6 @@
 {
   "name": "dsh-team-agents",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Reusable agent configuration library with per-agent models and conversation-driven collaboration for DeepSeek Harness.",
   "type": "module",
   "license": "UNLICENSED",

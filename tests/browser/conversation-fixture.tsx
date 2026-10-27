@@ -43,7 +43,7 @@ const fixtureResult: TeamRunExportResult = {
   mimeType: 'text/markdown;charset=utf-8', content: fixtureContent,
   byteLength: new TextEncoder().encode(fixtureContent).byteLength,
 };
-let activityStarts = 0, activityCloses = 0;
+let activityStarts = 0, activityCloses = 0, snapshotReads = 0;
 let pushActivity: ((value: MemberActivity) => void) | undefined;
 const activityFrame = (sequence = 1, failed = false): MemberActivity => ({
   ownerSessionId: snapshot.ownerSessionId, teamId: snapshot.id, member: 'backend', childSessionId: 'fixture-child', sequence,
@@ -56,6 +56,12 @@ const activityFrame = (sequence = 1, failed = false): MemberActivity => ({
 });
 const actions: TeamSettingsActions = {
   watchMember: async function* (member, signal) {
+    if (member === 'tester') {
+      snapshotReads++;
+      yield { ...activityFrame(), member, childSessionId: null, cursor: -1, live: false, status: 'not-started', phase: 'idle',
+        startedAt: null, endedAt: null, elapsedMs: null, lastActivityAt: null, task: null, entries: [], liveOutput: '' };
+      return;
+    }
     if (member !== 'backend') return forbidden('unexpected-member');
     activityStarts++;
     const queue: MemberActivity[] = [activityFrame()];
@@ -224,7 +230,16 @@ async function checkExport(page: HTMLElement) {
   HTMLAnchorElement.prototype.click = nativeAnchorClick;
 }
 async function checkActivity(page: HTMLElement) {
-  checks.push(record('member streams do not open automatically', activityStarts === 0, activityStarts));
+  checks.push(record('member streams do not open automatically', activityStarts === 0 && snapshotReads === 0, { activityStarts, snapshotReads }));
+  const pendingMember = [...page.querySelectorAll<HTMLButtonElement>('.dta-member-open')].find(button => button.textContent?.includes('tester'))!;
+  pendingMember.click(); await settle();
+  const pendingPanel = page.querySelector<HTMLElement>('.dta-activity')!;
+  checks.push(record('never-started member shows a ready snapshot instead of a disconnect',
+    pendingPanel.querySelector('[role=status]')?.textContent === '快照已读取 · 暂无成员会话' && !pendingPanel.textContent?.includes('连接已断开'), null));
+  [...pendingPanel.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === '刷新快照')!.click(); await settle();
+  checks.push(record('snapshot refresh is explicit and never runs an Agent', snapshotReads === 2 && activityStarts === 0 && calls.length === 0, { snapshotReads, activityStarts, calls }));
+  [...pendingPanel.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === '关闭成员详情')!.click(); await settle();
+  checks.push(record('closing a snapshot returns to the member list', page.querySelector('.dta-activity') === null, null));
   const select = [...page.querySelectorAll<HTMLButtonElement>('.dta-member-open')].find(button => button.textContent?.includes('backend'));
   select?.click(); await settle();
   const panel = page.querySelector<HTMLElement>('.dta-activity');

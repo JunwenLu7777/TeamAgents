@@ -37,7 +37,7 @@ export function MemberActivityPanel(props: MemberActivityPanelProps) {
 }
 function ActivityState({ ownerSessionId, teamId, member, watch, t, onClose }: MemberActivityPanelProps) {
   const [data, setData] = useState<MemberActivity | null>(null);
-  const [connection, setConnection] = useState<'connecting' | 'connected' | 'ended' | 'error'>('connecting');
+  const [connection, setConnection] = useState<'connecting' | 'connected' | 'snapshot' | 'ended' | 'error'>('connecting');
   const [error, setError] = useState('');
   const [retry, setRetry] = useState(0);
   const [, tick] = useState(0);
@@ -49,15 +49,23 @@ function ActivityState({ ownerSessionId, teamId, member, watch, t, onClose }: Me
     setData(null); setConnection('connecting'); setError('');
     void (async () => {
       let sequence = 0;
+      let lastFrame: MemberActivity | undefined;
       try {
         for await (const raw of watch(member.name, controller.signal)) {
           if (controller.signal.aborted) return;
           const frame = MemberActivitySchema.parse(raw);
           if (frame.ownerSessionId !== ownerSessionId || frame.teamId !== teamId || frame.member !== member.name ||
             (member.sessionId && frame.childSessionId !== member.sessionId) || frame.sequence <= sequence) throw new Error(t('activity.mismatch'));
+          lastFrame = frame;
           sequence = frame.sequence; receivedAt.current = performance.now(); frozenDelta.current = 0; setData(frame); setConnection('connected');
         }
-        if (!controller.signal.aborted) { frozenDelta.current = Math.max(0, performance.now() - receivedAt.current); setConnection('ended'); }
+        if (!controller.signal.aborted) {
+          frozenDelta.current = Math.max(0, performance.now() - receivedAt.current);
+          // No child session means the Host intentionally returns one snapshot, not
+          // a subscription. Only a successful EOF with such a frame is normal;
+          // empty streams, active-session EOFs and thrown errors remain distinct.
+          setConnection(lastFrame?.childSessionId === null && !lastFrame.live ? 'snapshot' : 'ended');
+        }
       } catch (failure) {
         if (!controller.signal.aborted) {
           frozenDelta.current = Math.max(0, performance.now() - receivedAt.current);
@@ -77,15 +85,15 @@ function ActivityState({ ownerSessionId, teamId, member, watch, t, onClose }: Me
   return <section className="dta-activity" aria-label={t('activity.title', { name: member.name })}>
     <style>{styles}</style>
     <header><h4>{t('activity.title', { name: member.name })}</h4><div className="activity-controls">
-      <button type="button" onClick={() => setRetry(value => value + 1)} disabled={connection === 'connecting'}>{t('activity.reconnect')}</button>
+      <button type="button" onClick={() => setRetry(value => value + 1)} disabled={connection === 'connecting'}>{t(connection === 'snapshot' ? 'activity.refresh' : 'activity.reconnect')}</button>
       <button type="button" onClick={onClose}>{t('activity.close')}</button>
     </div></header>
     <p className="activity-note">{member.role} · {member.model ? t('member.model', member.model) : t('member.inheritedModel')}</p>
     <p className="activity-note">{t('activity.readonly')}</p>
-    <p role="status">{t(connection === 'connecting' ? 'activity.connecting' : connection === 'connected' ? 'activity.connected' : 'activity.ended')}</p>
+    <p role="status">{t(connection === 'connecting' ? 'activity.connecting' : connection === 'connected' ? 'activity.connected' : connection === 'snapshot' ? 'activity.snapshot' : 'activity.ended')}</p>
     {connection === 'error' && <p className="activity-error" role="alert">{t('activity.failedConnection', { message: error })}</p>}
     {data && <>
-      {!isConnected && <p className="activity-note">{t('activity.stale')}</p>}
+      {(connection === 'ended' || connection === 'error') && <p className="activity-note">{t('activity.stale')}</p>}
       <div className="activity-metrics">
         <strong>{t(`activity.status.${data.status}`)}</strong>
         <span>{t(`activity.phase.${data.phase}`)}</span>
